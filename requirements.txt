@@ -1,0 +1,10 @@
+pydantic>=2.0.0
+python-dotenv
+langchain
+langchain-google-genai
+neo4j>=5.0.0
+streamlit
+pyvis
+langchain-neo4j
+langchain-community
+networkx
