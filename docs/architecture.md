@@ -92,16 +92,3 @@
 | `Entity` 계열 | `id`(PK=name), `name` | 키워드 무관 공유 → 크로스-키워드 분석 가능 |
 
 ---
-
-## 💰 4. 특징 및 향후 최적화 전략 (Cost & Automation)
-
-엔터프라이즈 도입을 위한 핵심 과제 및 설계 방향입니다.
-
-### 1) 3-Tier Cost Routing Architecture (비용 최적화)
-수많은 비정형 텍스트를 모두 고비용 LLM(GPT-4o, Gemini Pro 등)에 태우는 것은 비효율적입니다.
-* **Tier 3 (Junk Drop):** 단순 정보, 노이즈 기사는 정규표현식이나 소형 분류 모델로 사전 차단 ($0 비용).
-* **Tier 2 (General Info):** 일반 시장 동향은 로컬 sLM(소형 언어모델) 또는 GLiNER(개체명 인식 특화 모델)를 활용하여 가볍게 노드 추출.
-* **Tier 1 (High Value DL):** M&A 피인수, 핵심 공급망 이슈 등 실사에 영향을 주는 핵심 뉴스에만 GPT-4o / Gemini를 할당하여 심층 엣지(Edge) 추론.
-
-### 2) Pipeline Automation
-데이터 크롤링부터 Entity Resolution, Neo4j DB 적재로 이어지는 배치성 작업을 **Apache Airflow** 혹은 **Prefect**와 같은 오케스트레이션 툴과 연동하여, 매일 장 개장 전 완전 자동화된 파이프라인으로 구성하는 것을 목표로 합니다. 현재 구현된 증분 업데이트 구조는 이 자동화의 핵심 기반이 됩니다.
