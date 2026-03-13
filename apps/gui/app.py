@@ -165,14 +165,18 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                 WHERE r.source_url IN article_urls
                   AND NOT 'Keyword' IN labels(n) AND NOT 'Article' IN labels(n)
                   AND NOT 'Keyword' IN labels(m) AND NOT 'Article' IN labels(m)
-                  AND n.id IS NOT NULL AND m.id IS NOT NULL
-                RETURN n.id AS source, labels(n)[0] AS source_type,
-                       m.id AS target, labels(m)[0] AS target_type,
-                       type(r) AS edge_type,
-                       r.description AS description,
-                       r.source_article AS source_article,
-                       r.source_url AS source_url
-                LIMIT {GRAPH_QUERY_LIMIT}
+
+                // [중복 제거 강화] 노드 객체가 달라도 '이름(id)'이 같으면 하나로 묶음
+                WITH trim(n.id) AS s_id, trim(m.id) AS t_id, type(r) AS r_type, r.source_url AS r_url,
+                     collect(n) AS ns, collect(m) AS ms, collect(r) AS rs
+                RETURN s_id AS source, 
+                       head([lbl IN labels(ns[0]) WHERE lbl <> 'Entity' AND lbl <> 'Article']) AS source_type,
+                       t_id AS target, 
+                       head([lbl IN labels(ms[0]) WHERE lbl <> 'Entity' AND lbl <> 'Article']) AS target_type,
+                       r_type AS edge_type,
+                       r_url AS source_url,
+                       head([res IN rs WHERE res.description IS NOT NULL | res.description]) AS description,
+                       head([res IN rs WHERE res.source_article IS NOT NULL | res.source_article]) AS source_article
             """, **params)]
             centrality = {r["node_id"]: r["degree"] for r in session.run(f"""
                 MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:Article)
@@ -430,31 +434,44 @@ for node in nodes:
     )
 
 edge_url_map = {}
-for rec in edges:
-    key = f"{rec['source']}||{rec['target']}"
+pair_counter = collections.defaultdict(int)
+
+for i, rec in enumerate(edges):
+    src, tgt = rec["source"], rec["target"]
+    edge_id = f"e_{i}"  # 고유 ID 부여
+    
+    # 동일 노드 쌍 간의 엣지 개수에 따라 곡률(roundness) 조정
+    pair_key = tuple(sorted((src, tgt))) 
+    pair_counter[pair_key] += 1
+    count = pair_counter[pair_key]
+    # 첫 번째는 직선(0) 혹은 아주 작은 곡율, 이후는 0.15씩 증가하며 퍼짐
+    roundness = 0.0 if count == 1 else 0.15 * (count // 2) * (1 if count % 2 == 0 else -1)
+
     tooltip = f"[{rec['edge_type']}]"
     if rec.get("description"):
         tooltip += f"\n{rec['description']}"
     if rec.get("source_article"):
         tooltip += f"\n📰 {rec['source_article']}"
+    
     has_url = bool(rec.get("source_url"))
     if has_url:
-        edge_url_map[key] = rec["source_url"]
+        edge_url_map[edge_id] = rec["source_url"]
         tooltip += "\n🔗 클릭하여 원문 보기"
-    # 관계 유형: 소문자 + 언더스코어 → 공백으로 가독성 개선
+
     edge_label = rec["edge_type"].lower().replace("_", " ")
     display_label = f"🔗 {edge_label}" if has_url else edge_label
 
     net.add_edge(
-        rec["source"], rec["target"],
+        src, tgt,
+        id=edge_id,  # 고유 ID 설정
         label=display_label,
         title=tooltip,
-        color={"color": "#5DADE2" if has_url else "#95A5A6",   # 기사없는 엣지: 밝은 회색
+        color={"color": "#5DADE2" if has_url else "#95A5A6", 
                "highlight": "#FFD700"},
         width=2 if has_url else 1,
-        dashes=False if has_url else [6, 6],                   # 기사없는 엣지: 점선
+        dashes=False if has_url else [6, 6],
         arrows={"to": {"enabled": True, "scaleFactor": 0.6}},
-        smooth={"type": "curvedCW", "roundness": 0.1},
+        smooth={"type": "curvedCW", "roundness": roundness},
         font={"size": 9, "color": "#5DADE2" if has_url else "#BDC3C7",
               "bold": False, "strokeWidth": 2, "strokeColor": "#000000"},
     )
@@ -471,9 +488,7 @@ window.addEventListener('load', function() {{
             network.on('click', function(params) {{
                 if (params.edges.length > 0 && params.nodes.length === 0) {{
                     var edgeId = params.edges[0];
-                    var edgeObj = edges.get(edgeId);
-                    if (!edgeObj) return;
-                    var url = edgeUrlMap[edgeObj.from + '||' + edgeObj.to];
+                    var url = edgeUrlMap[edgeId];
                     if (url) window.open(url, '_blank');
                 }}
             }});

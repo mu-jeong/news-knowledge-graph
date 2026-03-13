@@ -1,5 +1,3 @@
-import os
-import re
 import math
 import urllib.request
 import urllib.parse
@@ -15,33 +13,21 @@ from src.configs.settings import (
 )
 
 
-def _is_english(text: str, threshold: float = 0.5) -> bool:
-    """텍스트에서 ASCII 알파벳 비율이 threshold 이상이면 영문으로 판단합니다."""
+def _is_english(text: str) -> bool:
+    """제목 전체가 영문인 경우에만 영문 기사로 판단합니다. (한글이 하나라도 포함되어 있으면 한글 기사로 간주)"""
     if not text:
         return False
-    letters = re.findall(r'[a-zA-Z가-힣]', text)
-    if not letters:
+    
+    # 문장에 한글이 하나라도 포함되어 있으면 영문 기사가 아님
+    if re.search(r'[가-힣]', text):
         return False
-    ascii_ratio = sum(1 for c in letters if c.isascii()) / len(letters)
-    return ascii_ratio >= threshold
+        
+    # 한글이 전혀 없고 영문 알파벳이 존재하는 경우에만 영문으로 판별
+    if re.search(r'[a-zA-Z]', text):
+        return True
+        
+    return False
 
-
-def _translate_to_korean(text: str) -> str:
-    """LLM(Gemini)을 사용하여 영문 텍스트를 한국어로 번역합니다."""
-    try:
-        from langchain_google_genai import ChatGoogleGenerativeAI
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return text
-        llm = ChatGoogleGenerativeAI(model=LLM_MODEL, api_key=api_key)
-        response = llm.invoke(
-            f"다음 텍스트를 자연스러운 한국어로 번역해주세요. "
-            f"번역문만 출력하고 다른 설명은 하지 마세요:\n\n{text}"
-        )
-        return response.content.strip()
-    except Exception as e:
-        print(f"[번역 오류] {e}")
-        return text
 
 class NaverNewsProvider(BaseDataProvider):
     """
@@ -151,7 +137,6 @@ class NaverNewsProvider(BaseDataProvider):
         1. 제목 유사도가 similarity_threshold 이상인 기사를 중복으로 판별 → 대표 1건만 유지
         2. 중복 제거 후에도 max_per_day 초과 시 균등 샘플링
         """
-        from difflib import SequenceMatcher
         from collections import defaultdict
 
         def _clean_title(title: str) -> str:
@@ -175,19 +160,38 @@ class NaverNewsProvider(BaseDataProvider):
 
         for date_key in sorted(daily_groups.keys(), reverse=True):
             day_articles = daily_groups[date_key]
+            if not day_articles:
+                continue
 
-            # 1. 제목 유사도 기반 중복 제거
-            unique: List[Dict[str, Any]] = []
-            for article in day_articles:
-                title = _clean_title(article.get("title", ""))
-                is_duplicate = any(
-                    SequenceMatcher(None, title, _clean_title(u.get("title", ""))).ratio()
-                    >= similarity_threshold
-                    for u in unique
-                )
-                if not is_duplicate:
-                    unique.append(article)
+            # 1. 제목 유사도 기반 중복 제거 (TF-IDF + Cosine Similarity)
+            titles = [_clean_title(a.get("title", "")) for a in day_articles]
+            unique_indices = []
 
+            if titles:
+                try:
+                    from sklearn.feature_extraction.text import TfidfVectorizer
+                    from sklearn.metrics.pairwise import cosine_similarity
+                    
+                    # 단어(공백 기준) 및 2-gram 단위로 문맥 의미를 벡터화
+                    vectorizer = TfidfVectorizer(analyzer='word', ngram_range=(1, 2))
+                    tfidf_matrix = vectorizer.fit_transform(titles)
+                    sim_matrix = cosine_similarity(tfidf_matrix)
+
+                    for i in range(len(titles)):
+                        is_duplicate = False
+                        for j in unique_indices:
+                            # 코사인 유사도가 임계치 이상이면 중복으로 판별 (순서 무관)
+                            if sim_matrix[i, j] >= similarity_threshold:
+                                is_duplicate = True
+                                break
+                        if not is_duplicate:
+                            unique_indices.append(i)
+                except ValueError:
+                    # 모든 제목이 비어있거나 하는 등 벡터화 불가 상황 처리
+                    unique_indices = [0] if titles else []
+
+            unique = [day_articles[i] for i in unique_indices]
+            
             total_removed += len(day_articles) - len(unique)
 
             # 2. max_per_day 초과 시 균등 샘플링
@@ -221,13 +225,15 @@ class NaverNewsProvider(BaseDataProvider):
             clean_desc = item.get('description', '').replace('<b>', '').replace('</b>', '').replace('&quot;', '"')
             clean_link = item.get('originallink') or item.get('link', '')
 
-            # 영문 제목/내용이면 한국어로 번역
-            if _is_english(clean_title):
-                print(f"  [번역] 제목 영문 감지 → 한글 번역 중: {clean_title[:40]}...")
-                clean_title = _translate_to_korean(clean_title)
-            if _is_english(clean_desc):
-                print(f"  [번역] 내용 영문 감지 → 한글 번역 중...")
-                clean_desc = _translate_to_korean(clean_desc)
+            # 영문 제목/내용이면 제외
+            if _is_english(clean_title) or _is_english(clean_desc):
+                print(f"  [제외] 영문 기사 감지 → 크롤링 대상에서 제외: {clean_title[:40]}...")
+                # 예외 처리: 마지막 기사가 스킵되면서 지금까지 쌓인 청크가 있다면 저장
+                if idx == len(raw_data) - 1 and current_chunk:
+                    combined_text = "\n---\n".join(current_chunk)
+                    chunks.append(combined_text)
+                    current_chunk = []
+                continue
 
             # 하나의 뉴스 요약
             news_text = f"제목: {clean_title}\n링크: {clean_link}\n내용: {clean_desc}"
@@ -235,9 +241,10 @@ class NaverNewsProvider(BaseDataProvider):
 
             # chunk_size만큼 쌓이거나 마지막 데이터일 때 하나의 문자열로 결합
             if len(current_chunk) >= chunk_size or idx == len(raw_data) - 1:
-                combined_text = "\n---\n".join(current_chunk)
-                chunks.append(combined_text)
-                current_chunk = []
+                if current_chunk:
+                    combined_text = "\n---\n".join(current_chunk)
+                    chunks.append(combined_text)
+                    current_chunk = []
         
         print(f"총 {len(raw_data)}개의 뉴스를 {len(chunks)}개의 청크로 압축(클러스터링)했습니다.")
         return chunks

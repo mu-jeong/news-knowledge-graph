@@ -136,35 +136,40 @@ class Neo4jLoader:
         with self.driver.session() as session:
             # 1. 노드(Entities) 적재
             for entity in graph_data.entities:
-                label = entity.type.replace(" ", "_").capitalize()
+                name = entity.name.strip()
+                label = entity.type.replace(" ", "_").strip().capitalize()
                 if not label:
                     label = "Entity"
 
+                # 모든 노드를 'Entity'라는 공통 라벨로 먼저 MERGE하여 ID 중복 방지 (이름 앞뒤 공백 제거)
+                # 그 후 LLM이 지정한 구체적인 타입을 추가 라벨로 설정
                 node_query = f"""
-                MERGE (n:`{label}` {{id: $name}})
+                MERGE (n:Entity {{id: $name}})
                 ON CREATE SET n.name = $name
-                ON MATCH SET n.name = $name
+                SET n:`{label}`
                 """
-                session.run(node_query, name=entity.name)
+                session.run(node_query, name=name)
 
             # 2. 엣지(Relations) 적재
             for rel in graph_data.relations:
-                edge_type = rel.type.replace(" ", "_").upper()
+                s_name = rel.source.strip()
+                t_name = rel.target.strip()
+                edge_type = rel.type.replace(" ", "_").strip().upper()
                 if not edge_type:
                     edge_type = "RELATED_TO"
 
+                # 한 기사(source_url) 내에서 하나의 노드 쌍+관계타입은 단 하나만 존재하도록 MERGE
                 edge_query = f"""
-                MATCH (s {{id: $source_name}})
-                MATCH (t {{id: $target_name}})
-                MERGE (s)-[r:`{edge_type}`]->(t)
+                MATCH (s:Entity {{id: $source_name}})
+                MATCH (t:Entity {{id: $target_name}})
+                MERGE (s)-[r:`{edge_type}` {{source_url: $source_url}}]->(t)
                 SET r.description    = $description,
-                    r.source_article = $source_article,
-                    r.source_url     = $source_url
+                    r.source_article = $source_article
                 """
                 session.run(
                     edge_query,
-                    source_name=rel.source,
-                    target_name=rel.target,
+                    source_name=s_name,
+                    target_name=t_name,
                     description=rel.description or "",
                     source_article=rel.source_article or "",
                     source_url=rel.source_url or "",

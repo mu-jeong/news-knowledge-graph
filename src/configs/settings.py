@@ -33,7 +33,7 @@ MAX_ARTICLES_PER_DAY: int = 30
 
 # 제목 유사도 임계값 (이 값 이상이면 중복 기사로 판별)
 # 0.0 ~ 1.0 / 낮출수록 더 공격적으로 중복 제거
-SIMILARITY_THRESHOLD: float = 0.6
+SIMILARITY_THRESHOLD: float = 0.3
 
 
 # ──────────────────────────────────────────
