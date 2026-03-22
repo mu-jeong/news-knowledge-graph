@@ -1,3 +1,5 @@
+import os
+import re
 import math
 import urllib.request
 import urllib.parse
@@ -9,7 +11,7 @@ from src.core.crawlers.base_provider import BaseDataProvider
 from src.configs.settings import (
     DAYS_BACK_PER_PAGE, MAX_PAGES,
     MAX_ARTICLES_PER_DAY, SIMILARITY_THRESHOLD,
-    LLM_MODEL,
+    LLM_MODEL, ALLOWED_NEWS_DOMAINS,
 )
 
 
@@ -29,10 +31,20 @@ def _is_english(text: str) -> bool:
     return False
 
 
+def _is_allowed_source(url: str) -> bool:
+    """URL이 허용된 뉴스 도메인 목록에 속하는지 확인합니다."""
+    if not url:
+        return False
+    for domain in ALLOWED_NEWS_DOMAINS:
+        if domain in url:
+            return True
+    return False
+
+
 class NaverNewsProvider(BaseDataProvider):
     """
     네이버 뉴스 API를 연동하여 특정 키워드 관련 뉴스를 가져오고,
-    유사한 주제(단순화된 방식)로 텍스트를 청크 단위로 묶는 클래스.
+    유사한 주제(단순화된 방식)로 텍스트를 배치(Batch) 단위로 묶는 클래스.
     """
 
     def __init__(self, client_id: str = None, client_secret: str = None):
@@ -42,25 +54,24 @@ class NaverNewsProvider(BaseDataProvider):
         if not self.client_id or not self.client_secret:
             print("Warning: NAVER_CLIENT_ID and NAVER_CLIENT_SECRET are not set.")
 
-    def fetch_data(self, keyword: str, days_back: int = 7,
-                   since_date: Optional[datetime] = None) -> List[Dict[str, Any]]:
+    def fetch_data(self, keyword: str, days_back: int = 1, watermarks: dict = None) -> List[Dict[str, Any]]:
         """
         네이버 뉴스 API에서 키워드 검색을 통해 최근 기사를 가져옵니다.
         days_back에 비례해 페이지네이션을 적용합니다 (하루 ~10건 추정, 최대 1,000건).
-
-        since_date를 지정하면 해당 시각 이후의 기사만 반환합니다.
+        watermarks(날짜별 워터마크 딕셔너리)를 지정하면 이전 수집 이력 이후 기사만 필터링합니다.
         """
+        if watermarks is None: watermarks = {}
         if not self.client_id or not self.client_secret:
              raise ValueError("API Keys are missing. Cannot fetch data.")
 
         enc_text = urllib.parse.quote(keyword)
 
-        # days_back 기준 컷오프 날짜
-        cutoff_date = datetime.now() - timedelta(days=days_back)
-        # since_date가 있으면 둘 중 더 최근 날짜를 기준으로 사용
-        effective_cutoff = since_date.replace(tzinfo=None) if since_date else cutoff_date
-        if since_date:
-            effective_cutoff = max(effective_cutoff, cutoff_date)
+        # days_back 기준 컷오프 날짜 (사용자가 요청한 수집 범위)
+        # 일(Day) 기준 컷오프: 5일이면 오늘부터 4일 전(총 5일)까지 수집
+        now = datetime.now()
+        # days_back=1이면 0일 전(오늘), days_back=5이면 4일 전(3/18) 00시부터 수집 시작
+        cutoff_date = now - timedelta(days=days_back - 1)
+        effective_cutoff = cutoff_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
         # DAYS_BACK_PER_PAGE일 = 100건 기준으로 필요한 페이지 수 산출 (최대 MAX_PAGES페이지)
         total_pages = min(math.ceil(days_back / DAYS_BACK_PER_PAGE), MAX_PAGES)
@@ -91,23 +102,43 @@ class NaverNewsProvider(BaseDataProvider):
                 # 페이지가 100건 미만이면 더 이상 결과 없음 → 조기 종료
                 if len(page_items) < 100:
                     break
+                    
+                # 성능/버그 해결: 현재 페이지의 마지막 기사가 effective_cutoff보다 옛날 것이면 뒤쪽 페이지 안 부름
+                if page_items:
+                    last_item = page_items[-1]
+                    try:
+                        last_date = datetime.strptime(last_item.get("pubDate", ""), "%a, %d %b %Y %H:%M:%S %z").replace(tzinfo=None)
+                        if last_date <= effective_cutoff:
+                            break
+                    except ValueError:
+                        pass
 
             # 날짜 필터링
             for item in all_items:
                 try:
                     pub_date = datetime.strptime(
                         item.get("pubDate", ""), "%a, %d %b %Y %H:%M:%S %z"
-                    )
-                    # since_date보다 "이후"인 기사만 포함 (같은 시각은 이미 처리됨)
-                    if pub_date.replace(tzinfo=None) > effective_cutoff:
-                        filtered_items.append(item)
+                    ).replace(tzinfo=None)
+                    
+                    # 1차 허들: days_back(수집기간 한계선)보다 과거이면 버림
+                    if pub_date <= effective_cutoff:
+                        continue
+                        
+                    # 2차 허들: 날짜(Date)별 워터마크가 있고, 이 워터마크 시각보다 이전이면 이미 수집된 것이므로 버림
+                    date_str = pub_date.strftime("%Y-%m-%d")
+                    if date_str in watermarks:
+                        wm_time = datetime.strptime(watermarks[date_str], "%Y-%m-%dT%H:%M:%S")
+                        if pub_date <= wm_time:
+                            continue
+                            
+                    filtered_items.append(item)
                 except ValueError:
                     continue
 
-            mode = (
-                f"마지막 기사 이후({since_date.strftime('%Y-%m-%d %H:%M')})부터"
-                if since_date else f"최근 {days_back}일"
-            )
+            if watermarks:
+                mode = f"날짜별 워터마크 기반 증분 수집"
+            else:
+                mode = f"전체 수집 (최근 {days_back}일)"
             pages_fetched = (len(all_items) + 99) // 100
             before_dedup = len(filtered_items)
 
@@ -208,16 +239,16 @@ class NaverNewsProvider(BaseDataProvider):
         )
         return result
 
-    def cluster_data(self, raw_data: List[Dict[str, Any]], chunk_size: int = 10) -> List[str]:
+    def cluster_data(self, raw_data: List[Dict[str, Any]], batch_size: int = 10) -> List[str]:
         """
         간단한 클러스터링: 발행일(시간) 내림차순으로 이미 정렬되어 있으므로, 
-        N개씩 묶어서 하나의 텍스트 청크로 병합합니다. (비용 절감을 위한 Batch 처리)
+        N개씩 묶어서 하나의 텍스트 배치로 병합합니다. (비용 절감을 위한 Batch 처리)
         """
         if not raw_data:
             return []
             
-        chunks = []
-        current_chunk = []
+        batches = []
+        current_batch = []
 
         for idx, item in enumerate(raw_data):
             # HTML 태그 및 탈출 문자 간단히 정제
@@ -225,29 +256,40 @@ class NaverNewsProvider(BaseDataProvider):
             clean_desc = item.get('description', '').replace('<b>', '').replace('</b>', '').replace('&quot;', '"')
             clean_link = item.get('originallink') or item.get('link', '')
 
-            # 영문 제목/내용이면 제외
+            # 영문 및 미승인 도메인 제외
             if _is_english(clean_title) or _is_english(clean_desc):
-                print(f"  [제외] 영문 기사 감지 → 크롤링 대상에서 제외: {clean_title[:40]}...")
-                # 예외 처리: 마지막 기사가 스킵되면서 지금까지 쌓인 청크가 있다면 저장
-                if idx == len(raw_data) - 1 and current_chunk:
-                    combined_text = "\n---\n".join(current_chunk)
-                    chunks.append(combined_text)
-                    current_chunk = []
+                # print(f"  [제외] 영문 기사 감지: {clean_title[:40]}...")
+                if idx == len(raw_data) - 1 and current_batch:
+                    combined_text = "\n---\n".join(current_batch)
+                    batches.append(combined_text)
+                    current_batch = []
+                continue
+            if not _is_allowed_source(clean_link):
+                # print(f"  [제외] 미승인 도메인 기사: {clean_link[:60]}")
+                if idx == len(raw_data) - 1 and current_batch:
+                    combined_text = "\n---\n".join(current_batch)
+                    batches.append(combined_text)
+                    current_batch = []
                 continue
 
-            # 하나의 뉴스 요약
-            news_text = f"제목: {clean_title}\n링크: {clean_link}\n내용: {clean_desc}"
-            current_chunk.append(news_text)
+            # 하나의 뉴스 요약에 기사 ID(순번) 부여
+            article_id_str = f"Article_{len(current_batch) + 1}"
+            news_text = f"[{article_id_str}]\n제목: {clean_title}\n링크: {clean_link}\n내용: {clean_desc}"
+            current_batch.append(news_text)
 
-            # chunk_size만큼 쌓이거나 마지막 데이터일 때 하나의 문자열로 결합
-            if len(current_chunk) >= chunk_size or idx == len(raw_data) - 1:
-                if current_chunk:
-                    combined_text = "\n---\n".join(current_chunk)
-                    chunks.append(combined_text)
-                    current_chunk = []
+            # batch_size만큼 쌓였다면 하나의 문자열로 결합 (마지막 처리는 루프 밖에서 일괄 수행)
+            if len(current_batch) >= batch_size:
+                combined_text = "\n---\n".join(current_batch)
+                batches.append(combined_text)
+                current_batch = []
         
-        print(f"총 {len(raw_data)}개의 뉴스를 {len(chunks)}개의 청크로 압축(클러스터링)했습니다.")
-        return chunks
+        # 마지막 남아있는 배치 처리
+        if current_batch:
+            combined_text = "\n---\n".join(current_batch)
+            batches.append(combined_text)
+        
+        print(f"총 {len(raw_data)}개의 뉴스를 {len(batches)}개의 묶음(배치)으로 압축(클러스터링)했습니다.")
+        return batches
 
     def get_article_metadata(self, raw_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """

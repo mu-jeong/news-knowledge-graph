@@ -7,55 +7,34 @@ class EntityResolver:
     지식 그래프가 파편화되는 것을 막기 위해 여러 동의어를 하나의 표준 명칭으로 통합합니다.
     """
     def __init__(self, alias_dict: Dict[str, str] = None):
-        # 1차 사전 기반 맵핑 (Rule-based: 비용 0)
-        # 실무에서는 이 딕셔너리를 DB나 별도의 설정 파일로 관리합니다.
-        self.alias_dict = alias_dict or {
-            # === 국내 주요 기업 ===
-            "삼전": "삼성전자",
-            "Samsung": "삼성전자",
-            "삼성": "삼성전자",
-            "SAMSUNG": "삼성전자",
-            "하이닉스": "SK하이닉스",
-            "SKhynix": "SK하이닉스",
-            "엘지전자": "LG전자",
-            "현차": "현대자동차",
-            "현대차": "현대자동차",
-            "네이버": "NAVER",
-            
-            # === 글로벌 빅테크 및 반도체 ===
-            "엔비디아": "NVIDIA",
-            "Nvidia": "NVIDIA",
-            "NVDIA": "NVIDIA",
-            "마이크로소프트": "Microsoft",
-            "MS": "Microsoft",
-            "마소": "Microsoft",
-            "TSMC": "TSMC",
-            "애플": "Apple",
-            "APPLE": "Apple",
-            "구글": "Google",
-            "알파벳": "Google",
-            "아마존": "Amazon",
-            "메타": "Meta",
-            "페이스북": "Meta",
-            "테슬라": "Tesla",
-            
-            # === 주요 인물 ===
-            "머스크": "일론 머스크",
-            "일론머스크": "일론 머스크",
-            "젠슨황": "젠슨 황",
-            "샘알트만": "샘 알트만",
-            "샘 알트먼": "샘 알트만",
-            "팀쿡": "팀 쿡",
-            
-            # === 기술 용어 및 기타 ===
-            "인공지능": "AI",
-            "Artificial Intelligence": "AI",
-            "대규모 언어 모델": "LLM",
-            "Large Language Model": "LLM",
-            "생성형AI": "생성형 AI",
-            "Generative AI": "생성형 AI",
-            "파운드리": "Foundry"
-        }
+        """
+        1차 사전 기반 맵핑 (Rule-based: 비용 0)
+        src/configs/entity_aliases.json 파일에서 동의어 맵핑 정보를 로드합니다.
+        """
+        if alias_dict is not None:
+            self.alias_dict = alias_dict
+        else:
+            self.alias_dict = self._load_default_aliases()
+
+    def _load_default_aliases(self) -> Dict[str, str]:
+        import json
+        import os
+        
+        # 파일 경로 설정 (src/configs/entity_aliases.json)
+        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+        config_path = os.path.join(base_dir, "configs", "entity_aliases.json")
+        
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                print(f"⚠️ Alias 설정을 불러오는데 실패했습니다: {e}")
+                return {}
+        else:
+            print(f"⚠️ Alias 설정 파일({config_path})을 찾을 수 없습니다.")
+            return {}
+
 
     def resolve(self, graph_data: GraphData) -> GraphData:
         """추출된 GraphData의 엔티티 명칭(노드 및 엣지 연결고리)을 정규화합니다."""

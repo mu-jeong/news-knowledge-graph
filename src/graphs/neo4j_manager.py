@@ -1,23 +1,21 @@
 import os
 from datetime import datetime
 from typing import Optional, List, Dict, Any
+import uuid
 from neo4j import GraphDatabase
+from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from src.configs.schema import GraphData
+from src.configs.settings import (
+    NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
+    EMBEDDING_MODEL, VECTOR_INDEX_DIM
+)
 
 
 class Neo4jLoader:
-    """
-    추출된 지식 그래프 데이터(Entities, Relations)를
-    로컬 또는 원격 Neo4j 데이터베이스에 적재하는 클래스입니다.
-
-    검색어(Keyword)별로 처리된 기사(Article)를 추적하여
-    재검색 시 마지막 기사 이후의 새 기사만 증분(Incremental) 업데이트합니다.
-    """
-
     def __init__(self):
-        self.uri = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
-        self.user = os.getenv("NEO4J_USER", "neo4j")
-        self.password = os.getenv("NEO4J_PASSWORD", "testtest")
+        self.uri = NEO4J_URI
+        self.user = NEO4J_USER
+        self.password = NEO4J_PASSWORD
 
         try:
             self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
@@ -28,149 +26,199 @@ class Neo4jLoader:
             self.driver = None
 
     def close(self):
-        """데이터베이스 드라이버 연결을 안전하게 종료합니다."""
         if self.driver:
             self.driver.close()
 
-    # ──────────────────────────────────────────
-    # 증분 업데이트: Keyword / Article 트래킹
-    # ──────────────────────────────────────────
+    def create_vector_index(self):
+        """NewsBatch 노드의 embedding 속성에 대한 Neo4j Vector Index 생성 (Gemini v4: 3072차원)"""
+        if not self.driver: return
+        try:
+            with self.driver.session() as session:
+                # 기존 인덱스가 차원수가 다를 수 있으므로 삭제 후 재생성 (선택 사항)
+                session.run("DROP INDEX batch_embedding IF EXISTS")
+                
+                session.run(f"""
+                CREATE VECTOR INDEX batch_embedding IF NOT EXISTS
+                FOR (c:NewsBatch) ON (c.embedding)
+                OPTIONS {{indexConfig: {{
+                  `vector.dimensions`: {VECTOR_INDEX_DIM},
+                  `vector.similarity_function`: 'cosine'
+                }}}}
+                """)
+                print("🧠 NewsBatch Vector Index 확인 완료!")
+        except Exception as e:
+            print(f"⚠️ Vector 인덱스 생성 오류: {e}")
 
-    def get_last_article_date(self, keyword: str) -> Optional[datetime]:
-        """
-        해당 키워드로 마지막으로 처리된 기사의 published_at을 반환합니다.
-        처음 검색하는 키워드이면 None을 반환합니다.
-        """
-        if not self.driver:
-            return None
+    def clear_database(self):
+        if not self.driver: return
         with self.driver.session() as session:
-            result = session.run(
-                """
-                MATCH (:Keyword {name: $keyword})-[:HAS_ARTICLE]->(a:Article)
-                RETURN max(a.published_at) AS last_date
-                """,
-                keyword=keyword,
-            )
-            record = result.single()
-            if record and record["last_date"]:
-                # Neo4j datetime → Python datetime 변환
-                neo4j_dt = record["last_date"]
+            session.run("MATCH (n) DETACH DELETE n")
+            print("🧹 Neo4j 데이터베이스 초기화 완료.")
+
+    def get_keyword_watermarks(self, keyword: str) -> dict:
+        """키워드 노드에 저장된 날짜별 마지막 수집 시각(watermarks)을 반환합니다."""
+        if not self.driver: return {}
+        with self.driver.session() as session:
+            result = session.run("MATCH (k:Keyword {name: $k}) RETURN coalesce(k.watermarks, '{}') AS wm", k=keyword).single()
+            if result:
+                import json
                 try:
-                    return neo4j_dt.to_native()
-                except Exception:
-                    return None
-        return None
+                    return json.loads(result["wm"])
+                except:
+                    pass
+        return {}
+        
+    def update_keyword_watermarks(self, keyword: str, new_wms: dict):
+        """키워드 노드에 날짜별 마지막 수집 시각(watermarks)을 병합하여 업데이트합니다."""
+        if not self.driver: return
+        with self.driver.session() as session:
+            import json
+            # 기존 워터마크를 불러와서 새 워터마크 중 더 나중 시간인 것들만 갱신
+            result = session.run("MATCH (k:Keyword {name: $k}) RETURN coalesce(k.watermarks, '{}') AS wm", k=keyword).single()
+            current = {}
+            if result:
+                try:
+                    current = json.loads(result["wm"])
+                except:
+                    pass
+            
+            for date_str, time_str in new_wms.items():
+                if date_str not in current or time_str > current[date_str]:
+                    current[date_str] = time_str
+                    
+            session.run("MERGE (k:Keyword {name: $k}) SET k.watermarks = $wm, k.last_updated = datetime()", 
+                        k=keyword, wm=json.dumps(current))
+
+    def filter_new_urls(self, urls: List[str]) -> List[str]:
+        """주어진 URL 목록 중 DB에 존재하지 않는(신규) URL만 필터링하여 반환합니다."""
+        if not self.driver or not urls: return []
+        with self.driver.session() as session:
+            # 일괄 조회를 위해 UNWIND 사용 (성능 최적화)
+            result = session.run("""
+                UNWIND $urls AS url
+                OPTIONAL MATCH (a:NewsArticle {id: url})
+                WITH url, a
+                WHERE a IS NULL
+                RETURN url
+            """, urls=urls)
+            return [record["url"] for record in result]
 
     def upsert_keyword(self, keyword: str):
-        """Keyword 노드를 생성하거나 last_updated를 갱신합니다."""
-        if not self.driver:
-            return
+        if not self.driver: return
         with self.driver.session() as session:
-            session.run(
-                """
-                MERGE (k:Keyword {name: $keyword})
-                SET k.last_updated = datetime()
-                """,
-                keyword=keyword,
-            )
+            session.run("MERGE (k:Keyword {name: $keyword}) SET k.last_updated = datetime()", keyword=keyword)
 
     def upsert_articles(self, keyword: str, articles: List[Dict[str, Any]]):
-        """
-        처리된 기사 목록을 Article 노드로 저장하고 Keyword와 연결합니다.
-        이미 존재하는 URL은 MERGE로 중복 생성을 방지합니다.
-        Keyword.last_updated는 현재 시각이 아닌 실제 기사의 최신 발행일로 기록됩니다.
-
-        articles: [{"url": str, "title": str, "published_at": datetime}, ...]
-        """
-        if not self.driver or not articles:
-            return
-
-        # 실제 기사 발행일 중 가장 최신 날짜 산출 (Keyword.last_updated 기준값)
-        valid_dates = [a["published_at"] for a in articles if a.get("published_at")]
-        latest_pub_date = max(valid_dates) if valid_dates else None
-
+        if not self.driver or not articles: return
         with self.driver.session() as session:
-            # 1. Article 노드 및 Keyword-Article 관계 적재
             for article in articles:
                 session.run(
                     """
+                    // 1. 키워드 노드 먼저 확실히 생성/업데이트
                     MERGE (k:Keyword {name: $keyword})
-                    MERGE (a:Article {url: $url})
-                    ON CREATE SET
-                        a.title        = $title,
+                    SET k.last_updated = datetime()
+                    
+                    WITH k
+                    // 2. 기사 노드 생성 및 속성 설정 (독립적으로 실행)
+                    MERGE (a:NewsArticle {id: $url})
+                    SET a.url = $url,
+                        a.title = $title,
                         a.published_at = $published_at,
-                        a.keyword      = $keyword
+                        a.keyword = $keyword
+                    SET a:Entity 
+                    
+                    WITH k, a
+                    // 3. 관계 연결
                     MERGE (k)-[:HAS_ARTICLE]->(a)
                     """,
-                    keyword=keyword,
-                    url=article.get("url", ""),
-                    title=article.get("title", ""),
-                    published_at=article.get("published_at"),
+                    keyword=keyword, url=article.get("url", ""),
+                    title=article.get("title", ""), published_at=article.get("published_at")
                 )
 
-            # 2. Keyword.last_updated를 실제 기사 최신 발행일로 갱신
-            if latest_pub_date:
-                session.run(
-                    """
-                    MERGE (k:Keyword {name: $keyword})
-                    SET k.last_updated = $last_updated
-                    """,
-                    keyword=keyword,
-                    last_updated=latest_pub_date,
-                )
-
-
-    # ──────────────────────────────────────────
-    # 그래프 적재 (Entity / Relation)
-    # ──────────────────────────────────────────
-
-    def load_graph_data(self, graph_data: GraphData):
+    def load_graph_data(self, graph_data: GraphData, batch_text: Optional[str] = None):
         """
-        Pydantic GraphData 객체를 받아 파싱한 뒤 Cypher 쿼리를 통해 노드와 엣지를 생성합니다.
-        멱등성(Idempotency)을 지키기 위해 CREATE 대신 MERGE를 활용합니다.
+        [지능형 데이터 적재]
+        기존의 NewsArticle 노드(크롤러)와 추출된 엔티티를 통합하고, 
+        원본 batch_text를 벡터 임베딩하여 NewsBatch 노드로 저장합니다.
         """
-        if not self.driver:
-            print("🚫 Neo4j 드라이버가 초기화되지 않아 적재를 건너뜁니다.")
-            return
+        if not self.driver: return
+        
+        batch_id = str(uuid.uuid4())
+        embedding = None
+        if batch_text:
+            try:
+                google_api_key = os.getenv("GOOGLE_API_KEY")
+                embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=google_api_key)
+                embedding = embedder.embed_query(batch_text)
+            except Exception as e:
+                print(f"⚠️ 임베딩 생성 실패: {e}")
 
         with self.driver.session() as session:
-            # 1. 노드(Entities) 적재
+            # 0. 거미줄 폭발 억제 및 본문 보존을 위한 NewsBatch 노드 생성
+            if batch_text and embedding:
+                import re
+                batch_urls = re.findall(r'링크:\s*([^\s]+)', batch_text)
+
+                session.run(
+                    "MERGE (c:NewsBatch {id: $batch_id}) SET c.text = $text, c.embedding = $embedding",
+                    batch_id=batch_id, text=batch_text, embedding=embedding
+                )
+                
+                # NewsBatch와 NewsArticle 간의 명시적 구조화 엣지 생성
+                for url in batch_urls:
+                    session.run(
+                        """
+                        MATCH (c:NewsBatch {id: $batch_id})
+                        MERGE (a:NewsArticle {id: $url})
+                        MERGE (c)-[:HAS_SOURCE]->(a)
+                        """,
+                        batch_id=batch_id, url=url
+                    )
+
+            # 1. 노드 적재
             for entity in graph_data.entities:
                 name = entity.name.strip()
-                label = entity.type.replace(" ", "_").strip().capitalize()
-                if not label:
-                    label = "Entity"
+                label = entity.type.replace(" ", "_").strip()
+                if not label: label = "Entity"
 
-                # 모든 노드를 'Entity'라는 공통 라벨로 먼저 MERGE하여 ID 중복 방지 (이름 앞뒤 공백 제거)
-                # 그 후 LLM이 지정한 구체적인 타입을 추가 라벨로 설정
-                node_query = f"""
-                MERGE (n:Entity {{id: $name}})
-                ON CREATE SET n.name = $name
-                SET n:`{label}`
+                props = {
+                    "id": name, "name": name
+                }
+
+                query = f"""
+                MERGE (n:Entity {{id: $id}}) 
+                SET n:`{label}`, 
+                    n.name = $name
                 """
-                session.run(node_query, name=name)
+                session.run(query, **props)
+                
+                # NewsBatch와 Entity의 연결 (동시 출현 명시)
+                if batch_text and embedding:
+                    session.run(
+                        "MATCH (c:NewsBatch {id: $batch_id}), (n:Entity {name: $name}) MERGE (c)-[:MENTIONS]->(n)",
+                        batch_id=batch_id, name=props["name"]
+                    )
 
-            # 2. 엣지(Relations) 적재
+            # 2. 관계 적재 (핵심: 다각도 매칭으로 사일로 제거)
             for rel in graph_data.relations:
-                s_name = rel.source.strip()
-                t_name = rel.target.strip()
                 edge_type = rel.type.replace(" ", "_").strip().upper()
-                if not edge_type:
-                    edge_type = "RELATED_TO"
+                if not edge_type: edge_type = "RELATED_TO"
 
-                # 한 기사(source_url) 내에서 하나의 노드 쌍+관계타입은 단 하나만 존재하도록 MERGE
-                edge_query = f"""
-                MATCH (s:Entity {{id: $source_name}})
-                MATCH (t:Entity {{id: $target_name}})
-                MERGE (s)-[r:`{edge_type}` {{source_url: $source_url}}]->(t)
-                SET r.description    = $description,
-                    r.source_article = $source_article
+                rel_query = f"""
+                MATCH (s:Entity) 
+                WHERE s.id = $s_name OR s.name = $s_name
+                
+                MATCH (t:Entity) 
+                WHERE t.id = $t_name OR t.name = $t_name
+                
+                MERGE (s)-[r:{edge_type}]->(t)
+                SET r.description = $desc, 
+                    r.source_url = $s_url, 
+                    r.source_article = $s_art,
+                    r.source_batch_id = $batch_id
                 """
-                session.run(
-                    edge_query,
-                    source_name=s_name,
-                    target_name=t_name,
-                    description=rel.description or "",
-                    source_article=rel.source_article or "",
-                    source_url=rel.source_url or "",
+                session.run(rel_query, 
+                    s_name=rel.source.strip(), t_name=rel.target.strip(),
+                    desc=rel.description, s_url=rel.source_url, s_art=rel.source_article,
+                    batch_id=batch_id if batch_text else None
                 )

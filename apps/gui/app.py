@@ -11,10 +11,12 @@ from pyvis.network import Network
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
 from src.configs.settings import (
-    LLM_MODEL, LLM_MAX_WORKERS, CHUNK_SIZE,
+    LLM_MODEL, LLM_MAX_WORKERS, BATCH_SIZE,
     DEFAULT_DAYS_BACK, GRAPH_QUERY_LIMIT, GRAPH_HOP_DEPTH,
     PAGERANK_DEFAULT_TOP,
 )
+
+from src.graphs.neo4j_manager import Neo4jLoader
 
 load_dotenv()
 
@@ -37,40 +39,71 @@ def run_pipeline(keyword: str, days_back: int = 7):
     log = []
 
     # 0. 마지막 처리 기사 날짜 조회 (증분 업데이트 기준점)
-    log.append(f"🔍 **[0/4] 증분 기준 조회 중...** `{keyword}`의 마지막 처리 기사를 확인합니다.")
+    log.append(f"🔍 **[0/4] 증분 기준 조회 중...** `{keyword}`의 과거 날짜별 수집 이력(Watermarks)을 확인합니다.")
     yield "\n".join(log)
+    watermarks = {}
     try:
+        from datetime import datetime, timedelta
         _loader_check = Neo4jLoader()
-        since_date = _loader_check.get_last_article_date(keyword)
+        watermarks = _loader_check.get_keyword_watermarks(keyword)
         _loader_check.close()
-        if since_date:
-            log.append(f"  → 📅 마지막 기사: `{since_date.strftime('%Y-%m-%d %H:%M')}` — 이후 기사만 수집합니다.")
+        
+        if watermarks:
+            log.append(f"  → 📅 DB에 기존 데이터가 확인되었습니다. 부분 수집된 날짜를 고려하여 신규 기사만 정밀 추출합니다.")
         else:
-            log.append(f"  → 🆕 처음 검색하는 키워드 — 최근 {days_back}일치 전체 수집합니다.")
+            log.append(f"  → 🆕 처음 검색하는 키워드 — 요청하신 **최근 {days_back}일치 전체**를 수집합니다.")
+        
     except Exception as _e:
-        since_date = None
-        log.append(f"  → ⚠️ 기준 날짜 조회 실패 (전체 수집): {_e}")
+        watermarks = {}
+        log.append(f"  → ⚠️ 수집 이력 조회 실패 (전체 수집 진행): {_e}")
+
     yield "\n".join(log)
 
     # 1. 뉴스 수집 (since_date 이후 기사만)
     log.append(f"\n📡 **[1/4] 뉴스 수집 중...** `{keyword}`")
     yield "\n".join(log)
+    try:
+        provider = NaverNewsProvider()
+        # 1. API를 통해 해당 범위의 기사들을 일단 모두 가져옴 (fetch_data) - watermark 적용
+        raw_articles = provider.fetch_data(keyword=keyword, days_back=days_back, watermarks=watermarks)
+        article_metadata = provider.get_article_metadata(raw_articles)
+        
+        # ───────── 지능형 DB 필터링 (Gap-free Incremental) ──────────
+        loader = Neo4jLoader()
+        all_urls = [a["url"] for a in article_metadata if a.get("url")]
+        # DB에 없는 URL만 필터링
+        new_urls = set(loader.filter_new_urls(all_urls))
+        loader.close()
+        
+        # 신규 기사만 필터링
+        filtered_article_metadata = [a for a in article_metadata if a["url"] in new_urls]
+        
+        if not filtered_article_metadata:
+            # 케이스 1: API에서 기사는 가져왔거나(all_urls), 워터마크에 의해 모두 필터링된 경우(watermarks)
+            if all_urls or watermarks:
+                log.append(f"  → ✨ **이미 최신 지식이 반영되어 있습니다.** (금일 요청 범위에서 새로 발행된 기사가 없습니다.)")
+                log.append("  💡 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+            # 케이스 2: API 결과 자체가 없고 기존 수집 이력도 없는 경우
+            else:
+                log.append("  → ❌ **수집된 기사가 전혀 없습니다.** (키워드 오타, 네이버 서버 일시 오류, 혹은 수집 허용 언론사에 해당 뉴스가 없을 수 있음)")
+            
+            yield "\n".join(log)
+            return
+             
+        # 새로운 기사가 있다면 배치를 재생성 (원래 batches는 raw_articles 기준이므로 걸러야 함)
+        # ※ 성능을 위해 raw_articles 중 신규인 것들만 다시 클러스터링
+        filtered_raw = [a for a in raw_articles if (a.get('originallink') or a.get('link', '')) in new_urls]
+        batches = provider.cluster_data(filtered_raw, batch_size=BATCH_SIZE)
+        article_metadata = filtered_article_metadata
+        # ─────────────────────────────────────────────────────────────
 
-    provider = NaverNewsProvider()
-    raw_articles = provider.fetch_data(keyword=keyword, days_back=days_back, since_date=since_date)
-    article_metadata = provider.get_article_metadata(raw_articles)
-    chunks = provider.cluster_data(raw_articles, chunk_size=CHUNK_SIZE)
-
-    if not chunks:
-        if since_date:
-            log.append(f"  → ✅ **이미 최신 상태입니다.** 마지막 기사(`{since_date.strftime('%Y-%m-%d %H:%M')}`) 이후 신규 기사가 없습니다.")
-        else:
-            log.append("  → ❌ 수집된 기사가 없습니다. API 키를 확인해주세요.")
+    except Exception as e:
+        log.append(f"  → ⚠️ 수집 중 예외 발생: {e}")
         yield "\n".join(log)
         return
 
-    log.append(f"  → {len(raw_articles)}개 기사 / {len(chunks)}개 청크 수집 완료 (신규)")
-    log.append(f"\n🤖 **[2/4] LLM 병렬 추출 시작...** ({len(chunks)}개 청크 동시 요청)")
+    log.append(f"  → 📡 {len(all_urls)}개 기사 중 **진짜 신규 {len(article_metadata)}개** 발견 (나머지 중복은 제외)")
+    log.append(f"\n🤖 **[2/4] LLM 병렬 추출 시작...** ({len(batches)}개 배치 동시 요청)")
     yield "\n".join(log)
 
     # 2. LLM 병렬 호출 (ThreadPoolExecutor)
@@ -78,27 +111,27 @@ def run_pipeline(keyword: str, days_back: int = 7):
     resolver = EntityResolver()
     all_resolved = []
 
-    def _extract_chunk(idx_chunk):
-        idx, chunk = idx_chunk
+    def _extract_batch(idx_batch):
+        idx, batch_text = idx_batch
         llm = ChatGoogleGenerativeAI(model=LLM_MODEL, api_key=google_api_key)
         structured_llm = llm.with_structured_output(GraphData)
-        prompt = get_graph_extraction_prompt(chunk)
+        prompt = get_graph_extraction_prompt(batch_text)
         result: GraphData = structured_llm.invoke(prompt)
         resolved = resolver.resolve(result)
-        return idx, resolved, len(result.entities), len(result.relations)
+        return idx, resolved, len(result.entities), len(result.relations), batch_text
 
     with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS) as executor:
-        futures = {executor.submit(_extract_chunk, (i, chunk)): i for i, chunk in enumerate(chunks)}
+        futures = {executor.submit(_extract_batch, (i, batch_text)): i for i, batch_text in enumerate(batches)}
         for future in as_completed(futures):
             try:
-                idx, resolved, n_ent, n_rel = future.result()
-                all_resolved.append(resolved)
-                log.append(f"  → 청크 [{idx+1}/{len(chunks)}]: 엔티티 {n_ent}개, 관계 {n_rel}개")
+                idx, resolved, n_ent, n_rel, batch_text = future.result()
+                all_resolved.append((resolved, batch_text))
+                log.append(f"  → 배치 [{idx+1}/{len(batches)}]: 엔티티 {n_ent}개, 관계 {n_rel}개")
             except Exception as e:
-                log.append(f"  ⚠️ 청크 실패: {e}")
+                log.append(f"  ⚠️ 배치 실패: {e}")
             yield "\n".join(log)
 
-    total_rels = sum(len(g.relations) for g in all_resolved)
+    total_rels = sum(len(g.relations) for g, _ in all_resolved)
     log.append(f"\n🔗 **[3/4] 엔티티 정규화 완료** → 총 {total_rels}개 관계 정규화")
     yield "\n".join(log)
 
@@ -109,20 +142,46 @@ def run_pipeline(keyword: str, days_back: int = 7):
     try:
         loader = Neo4jLoader()
         if loader.driver:
-            # 3-1. 엔티티/관계 MERGE 적재
-            for g in all_resolved:
-                loader.load_graph_data(g)
+            # 3-0. 벡터 인덱스 먼저 생성
+            loader.create_vector_index()
+            # 3-1. 엔티티/관계 및 NewsBatch MERGE 적재
+            for g, batch_text in all_resolved:
+                loader.load_graph_data(g, batch_text=batch_text)
             # 3-2. Article 노드 저장 + Keyword 노드 갱신
             loader.upsert_articles(keyword, article_metadata)
+            
+            new_wms = {}
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            for art in article_metadata:
+                dt = art["published_at"]
+                d_str = dt.strftime("%Y-%m-%d")
+                t_str = dt.strftime("%Y-%m-%dT%H:%M:%S")
+                
+                # 오늘 기사라면 현재 시각까지 완료된 것으로 간주
+                if d_str == today_str:
+                    t_str = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+                
+                # 해당 날짜의 기존값보다 더 나중 관측 시점이면 갱신 후보
+                if d_str not in new_wms or t_str > new_wms[d_str]:
+                    new_wms[d_str] = t_str
+            
+            if new_wms:
+                loader.update_keyword_watermarks(keyword, new_wms)
+            
             loader.close()
-            log.append(f"  → ✅ 적재 완료! (기사 {len(article_metadata)}개 누적)")
+            log.append(f"  → ✅ 적재 및 수집 워터마크 기록 완료! (기사 {len(article_metadata)}개 누적)")
         else:
             log.append("  → ❌ Neo4j 연결 실패")
     except Exception as e:
-        log.append(f"  → ❌ 적재 오류: {e}")
+        import traceback
+        error_msg = f"  → ❌ 적재 오류: {e}\n\n```\n{traceback.format_exc()}\n```"
+        log.append(error_msg)
+        yield "\n".join(log)
+        return False # 실패 반환
 
     log.append(f"\n🎉 **파이프라인 완료!** 아래 그래프가 자동으로 갱신됩니다.")
     yield "\n".join(log)
+    return True # 성공 반환
 
 
 
@@ -157,36 +216,48 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
 
         with loader.driver.session() as session:
             params = {"keyword": keyword, "dt_from": dt_from, "dt_to": dt_to}
-            records = [r.data() for r in session.run(f"""
-                MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:Article)
+            # 키워드->기사 관계와 엔티티 간 관계를 결합하여 조회
+            query = f"""
+                // 1. 엔티티 관계 조회
+                MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(a.url) AS article_urls
-                MATCH (n)-[r]->(m)
-                WHERE r.source_url IN article_urls
-                  AND NOT 'Keyword' IN labels(n) AND NOT 'Article' IN labels(n)
-                  AND NOT 'Keyword' IN labels(m) AND NOT 'Article' IN labels(m)
+{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+                
+                MATCH (n:Entity)-[r]->(m:Entity)
+                WHERE r.source_url IN article_ids 
+                   OR r.source_article IN article_titles
+                
+                RETURN n.id AS source, 
+                       head([lbl IN labels(n) WHERE lbl <> 'Entity']) AS source_type,
+                       m.id AS target, 
+                       head([lbl IN labels(m) WHERE lbl <> 'Entity']) AS target_type,
+                       type(r) AS edge_type,
+                       r.source_url AS source_url,
+                       r.description AS description,
+                       COALESCE(r.source_article, '정보 없음') AS source_article
+                
+                UNION
+                
+                // 2. 검색어와 뉴스 기사의 관계 추가 (보라색 노드 시각화용)
+                MATCH (k:Keyword {{name: $keyword}})-[r:HAS_ARTICLE]->(a:NewsArticle)
+                WHERE 1=1
+{date_filter}                RETURN k.name AS source, 'Keyword' AS source_type,
+                       a.id AS target, 'NewsArticle' AS target_type,
+                       type(r) AS edge_type,
+                       '' AS source_url, '' AS description, a.title AS source_article
+            """
+            records = [r.data() for r in session.run(query, **params)]
 
-                // [중복 제거 강화] 노드 객체가 달라도 '이름(id)'이 같으면 하나로 묶음
-                WITH trim(n.id) AS s_id, trim(m.id) AS t_id, type(r) AS r_type, r.source_url AS r_url,
-                     collect(n) AS ns, collect(m) AS ms, collect(r) AS rs
-                RETURN s_id AS source, 
-                       head([lbl IN labels(ns[0]) WHERE lbl <> 'Entity' AND lbl <> 'Article']) AS source_type,
-                       t_id AS target, 
-                       head([lbl IN labels(ms[0]) WHERE lbl <> 'Entity' AND lbl <> 'Article']) AS target_type,
-                       r_type AS edge_type,
-                       r_url AS source_url,
-                       head([res IN rs WHERE res.description IS NOT NULL | res.description]) AS description,
-                       head([res IN rs WHERE res.source_article IS NOT NULL | res.source_article]) AS source_article
-            """, **params)]
+            
             centrality = {r["node_id"]: r["degree"] for r in session.run(f"""
-                MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:Article)
+                MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(a.url) AS article_urls
-                MATCH (n)-[r]-(m)
-                WHERE r.source_url IN article_urls
-                  AND NOT 'Keyword' IN labels(n) AND NOT 'Article' IN labels(n)
-                WITH n, count(r) AS degree
-                RETURN n.id AS node_id, degree
+{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+                
+                MATCH (n:Entity)-[r]-(m:Entity)
+                WHERE r.source_url IN article_ids 
+                   OR r.source_article IN article_titles
+                RETURN n.id AS node_id, count(r) AS degree
             """, **params)}
         loader.close()
         return records, centrality
@@ -200,8 +271,10 @@ def get_connected(keyword, all_edges, max_hop=3):
         return None
     adj = collections.defaultdict(list)
     for e in all_edges:
-        adj[e["source"]].append(e["target"])
-        adj[e["target"]].append(e["source"])
+        src, tgt = e.get("source"), e.get("target")
+        if src and tgt:
+            adj[src].append(tgt)
+            adj[tgt].append(src)
     visited = {keyword: 0}
     queue = collections.deque([(keyword, 0)])
     while queue:
@@ -230,14 +303,14 @@ with st.sidebar:
         placeholder="예: 삼성전자, SK하이닉스, NVIDIA",
         label_visibility="collapsed",
     )
-    days_input = st.number_input("수집 기간 (일)", min_value=1, max_value=30, value=DEFAULT_DAYS_BACK)
+    days_input = st.number_input("수집 기간 (일)", min_value=1, max_value=100, value=DEFAULT_DAYS_BACK)
     run_btn = st.button("🚀 검색 & 그래프 생성", type="primary", use_container_width=True)
 
     st.divider()
     st.subheader("📅 기사 기간 필터")
     from datetime import date as _date, timedelta as _timedelta
     _today = _date.today()
-    _default_from = _today - _timedelta(days=30)
+    _default_from = _today - _timedelta(days=100)
     date_range = st.date_input(
         "date_range_filter",
         value=(_default_from, _today),
@@ -254,11 +327,25 @@ with st.sidebar:
 
     st.divider()
     st.markdown("""
-**범례**
-- 🟡 금색: 검색 키워드 노드
-- 🔴 빨강: 기업  🟢 초록: 인물  🔵 파랑: 기술  🟠 주황: 제품
-- **🔗 실선 (파란)**: 기사 출처 있음 — 클릭 시 원문 이동
-- **점선 (회색)**: 기사 출처 없음
+**범례 (엔티티 구조별 색상)**
+
+**1. 뼈대 (메타데이터)**
+- 🟣 **보라색**: 검색 키워드 기준 (Keyword)
+- 🟢 **청록색**: 뉴스 기둥 (NewsArticle)
+
+**2. 비즈니스 코어 (주요 분석 대상)**
+- 🔴 **빨간색**: 기업 (Company)
+- 🔵 **파란색**: 산업 생태계 (Industry)
+- 🟠 **주황색**: 기업의 제품/서비스 (Product)
+
+**3. 외부 환경 및 기타**
+- 🟡 **노란색(Gold)**: 거시경제/외부 충격 (MacroEvent)
+- ⚪ **회색**: 미분류 일반 명사 (Entity)
+
+---
+**관계(엣지) 연결 형태**
+- **🔗 실선 (파란)**: 기사 출처가 명확함 — 클릭 시 원문 뉴스로 이동
+- **➖ 점선 (회색)**: 기사 출처 없음 / 일반 엔티티 간 구조적 관계
 """)
 
     st.divider()
@@ -271,13 +358,33 @@ with st.sidebar:
     st.markdown("**관계 유형** (검색 후 선택 가능)")
     _et_placeholder = st.empty()
     st.markdown("**노드 유형**")
-    all_node_type_options = ["Company", "Person", "Technology", "Product", "Country", "Entity"]
+    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "MacroEvent", "NewsArticle", "Entity"]
+    # NewsArticle은 기본적으로 제외 (사용자 요청)
+    default_node_types = [t for t in all_node_type_options if t != "NewsArticle"]
     selected_node_types = st.multiselect(
         "node_type_filter",
         options=all_node_type_options,
-        default=all_node_type_options,
+        default=default_node_types,
         label_visibility="collapsed",
     )
+
+    st.divider()
+    if st.button("🗑️ 데이터베이스 초기화", use_container_width=True, help="Neo4j의 모든 데이터를 삭제하고 처음부터 다시 시작합니다."):
+        try:
+            import importlib
+            import src.graphs.neo4j_manager
+            importlib.reload(src.graphs.neo4j_manager)
+            from src.graphs.neo4j_manager import Neo4jLoader
+            loader = Neo4jLoader()
+            if loader.driver:
+                loader.clear_database()  # 이전에 추가한 clear_database 메서드 호출
+                loader.close()
+                st.success("✅ DB가 초기화되었습니다. 이제 검색 시 전체 데이터를 수집합니다.")
+                st.rerun()
+            else:
+                st.error("Neo4j 드라이버 연결에 실패했습니다.")
+        except Exception as e:
+            st.error(f"초기화 중 오류 발생: {e}")
 
 # 파이프라인 실행
 if run_btn and search_input.strip():
@@ -287,19 +394,25 @@ if run_btn and search_input.strip():
     log_area = st.empty()
 
     with st.spinner("파이프라인 실행 중..."):
+        pipeline_success = False
         for log_msg in run_pipeline(keyword, days_back=int(days_input)):
             log_area.markdown(log_msg)
+            # 마지막 yield 값이 True/False라면 성공 여부 판단
+            if log_msg is True: pipeline_success = True
+            if log_msg is False: pipeline_success = False
 
-    st.success("✅ 완료! 그래프가 아래에 표시됩니다.")
-    st.rerun()
+    if pipeline_success:
+        st.success("✅ 완료! 그래프가 아래에 표시됩니다.")
+        st.rerun()
 
 elif run_btn and not search_input.strip():
     st.sidebar.warning("검색어를 입력해 주세요.")
 
 
 # ─────────────────────────────
-# 그래프 표시
+# 메인 레이아웃: 수직 통합 배치 (위: 그래프, 아래: 채팅)
 # ─────────────────────────────
+st.header("🕸️ 지식 그래프")
 records, centrality = fetch_graph_data(
     keyword=search_input.strip() if search_input else "",
     date_from=view_date_from,
@@ -331,6 +444,7 @@ for rec in all_edges:
     node_types[rec["source"]] = rec.get("source_type")
     node_types[rec["target"]] = rec.get("target_type")
 
+
 # ① 엣지 타입 필터 (placeholder를 실제 multiselect로 교체)
 all_edge_type_options = sorted({e.get("edge_type") for e in all_edges if e.get("edge_type")})
 with st.sidebar:
@@ -357,7 +471,9 @@ if selected_node_types:
 if all_edges and pagerank_top < 100:
     G = nx.DiGraph()
     for e in all_edges:
-        G.add_edge(e["source"], e["target"])
+        # source나 target이 None이면 NetworkX에서 에러 발생하므로 스킵
+        if e.get("source") and e.get("target"):
+            G.add_edge(e["source"], e["target"])
     pr = nx.pagerank(G, alpha=0.85)
     cutoff_count = max(1, int(len(pr) * pagerank_top / 100))
     top_nodes = {n for n, _ in sorted(pr.items(), key=lambda x: -x[1])[:cutoff_count]}
@@ -389,19 +505,25 @@ color_map = {
     "Country": "#FFFF99",
 }
 
-net = Network(height="820px", width="100%", bgcolor="#1a1a2e",
+net = Network(height="600px", width="100%", bgcolor="#1a1a2e",
               font_color="white", directed=True)
 net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
                spring_strength=0.01, damping=0.09, overlap=0)
 
-# 노드 색상 맵 (더 선명한 파스텔 톤)
+# 노드 색상 맵 (엔티티 계층 구조 기반 테마 적용)
 color_map = {
-    "Company":    "#E74C3C",   # 선명한 빨강
-    "Person":     "#2ECC71",   # 선명한 초록
-    "Technology": "#3498DB",   # 선명한 파란
-    "Product":    "#E67E22",   # 설지화된 주황
-    "Country":    "#9B59B6",   # 볜란 보라
+    "Keyword":         "#8E44AD",   # 짙은 보라 (기준 축)
+    "NewsBatch":       "#b3ffcc",   # 연두 (표시 안됨)
+    "NewsArticle":     "#1ABC9C",   # 청록 (정보의 출처)
+    
+    "Company":         "#E74C3C",   # 빨강 (비즈니스 주체)
+    "Industry":        "#2980B9",   # 짙은 파랑 (산업 생태계)
+    "Product":         "#F39C12",   # 주황 (출시 제품)
+    
+    "MacroEvent":      "#F1C40F",   # 노랑/골드 (거시 충격)
+    "Entity":          "#95A5A6",   # 회색 (미분류)
 }
+
 
 # 노드 배경색에 따띻 폰트 색상 자동 선택 함수
 def _font_color_for(bg_hex: str) -> str:
@@ -419,15 +541,18 @@ for node in nodes:
     size = min(size, 48)
     color = color_map.get(node_types.get(node), "#7F8C8D")
     font_color = _font_color_for(color)
+    border_color = "#FFFFFF"
+    border_width = 2
     if node == filter_kw:
-        color = "#FFD700"
+        color = "#8E44AD"  # 검색 키워드(Keyword) 지정 보라색
         size = max(size, 40)
-        font_color = "#1a1a2e"
+        font_color = "#FFFFFF"
     net.add_node(
         node, label=node,
         title=f"🔵 {node}\n유형: {node_types.get(node, '?')} | 연결 수: {degree}",
         color={"background": color, "border": "#FFFFFF",
                "highlight": {"background": "#FFD700", "border": "#FFA500"}},
+        borderWidth=2,
         size=size,
         font={"size": 13, "color": font_color, "bold": True,
               "strokeWidth": 3, "strokeColor": "#000000"},
@@ -461,18 +586,20 @@ for i, rec in enumerate(edges):
     edge_label = rec["edge_type"].lower().replace("_", " ")
     display_label = f"🔗 {edge_label}" if has_url else edge_label
 
+    edge_color = "#5DADE2" if has_url else "#95A5A6"
+    edge_width = 2 if has_url else 1
+    
     net.add_edge(
         src, tgt,
-        id=edge_id,  # 고유 ID 설정
+        id=edge_id,
         label=display_label,
         title=tooltip,
-        color={"color": "#5DADE2" if has_url else "#95A5A6", 
-               "highlight": "#FFD700"},
-        width=2 if has_url else 1,
+        color={"color": edge_color, "highlight": "#FFD700"},
+        width=edge_width,
         dashes=False if has_url else [6, 6],
         arrows={"to": {"enabled": True, "scaleFactor": 0.6}},
         smooth={"type": "curvedCW", "roundness": roundness},
-        font={"size": 9, "color": "#5DADE2" if has_url else "#BDC3C7",
+        font={"size": 9, "color": edge_color,
               "bold": False, "strokeWidth": 2, "strokeColor": "#000000"},
     )
 
@@ -507,6 +634,83 @@ try:
     with open("graph.html", "w", encoding="utf-8") as f:
         f.write(html_raw)
     with open("graph.html", "r", encoding="utf-8") as f:
-        components.html(f.read(), height=840)
+        components.html(f.read(), height=620)
 except Exception as e:
     st.error(f"그래프 렌더링 오류: {e}")
+
+
+# ─────────────────────────────
+# Agentic Chat (Graph RAG) 구현
+# ─────────────────────────────
+st.divider()
+st.header("🔍 지식 기반 스마트 검색")
+
+import uuid
+from src.graphs.hybrid_rag import rag_app
+
+# 세션 처리
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+
+# 1. 검색창을 상단에 배치 (고정된 느낌을 주기 위해 container 사용)
+input_container = st.container()
+with input_container:
+    prompt = st.chat_input("수집된 데이터에 대해 질문해보세요. (예: 삼성전자 협력사는 어디야?, HBM 전망은?)")
+    
+chat_container = st.container()
+
+# 입력 및 응답 생성 로직
+if prompt:
+    # 사용자 메시지 추가 (메시지 리스트의 맨 뒤에 추가하지만 출력은 역순으로 함)
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    
+    # 즉시 답변 생성 시각화 (spinner)
+    with chat_container:
+        with st.chat_message("assistant"):
+            with st.spinner("AI가 최적의 검색 경로를 찾고 있습니다... 🔍"):
+                config = {"configurable": {"thread_id": st.session_state.thread_id}}
+                try:
+                    result = rag_app.invoke({"question": prompt, "retry_count": 0, "final_answer": None}, config=config)
+                    
+                    # Cypher 검증 실패 시 final_answer에 에러 메시지가 담겨옴
+                    final_answer = result.get("final_answer")
+                    if final_answer:
+                        answer = final_answer
+                        route = result.get("route", "text2cypher")
+                    else:
+                        answer = result.get("generation", "응답 생성 실패")
+                        route = result.get("route", "fallback")
+                    
+                    # 세션에 저장 (최신 답변을 위해 메시지 리스트에 추가)
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": answer,
+                        "route": route
+                    })
+                    st.rerun() # 전체 다시 그려서 최신 것이 위로 가게 함
+                except Exception as e:
+                    st.error(f"실행 중 오류: {e}")
+
+# 2. 대화 세트 구성 (질문-답변 쌍을 한 묶음으로 처리)
+chat_sets = []
+current_set = []
+for msg in st.session_state.messages:
+    if msg["role"] == "user":
+        if current_set:
+            chat_sets.append(current_set)
+        current_set = [msg]
+    else:
+        current_set.append(msg)
+if current_set:
+    chat_sets.append(current_set)
+    
+# 3. 대화 세트를 역순으로 출력하여 최신 묶음이 위로 오게 함 (질문 -> 답변 순서 유지)
+with chat_container:
+    for msg_set in reversed(chat_sets):
+        for msg in msg_set:
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                if msg.get("route"):
+                    st.caption(f"🛣️ 검색 경로 판단: `{msg['route']}`")

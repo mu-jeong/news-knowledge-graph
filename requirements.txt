@@ -9,3 +9,4 @@ langchain-neo4j
 langchain-community
 networkx
 scikit-learn
+langgraph

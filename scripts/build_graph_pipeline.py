@@ -9,6 +9,7 @@ load_dotenv()
 
 from src.core.crawlers.naver_news import NaverNewsProvider
 from src.configs.schema import GraphData, get_graph_extraction_prompt
+from src.configs.settings import LLM_MODEL
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 def main():
@@ -43,11 +44,11 @@ def main():
         print("⚠️ 알림: .env 파일에 GOOGLE_API_KEY(Gemini API Key)가 없어 LLM 추출은 생략합니다.")
         return
         
-    print("Gemini 2.5 Flash 모델에 첫 번째 청크를 주입하여 Entity와 Relation을 추출합니다...")
+    print(f"{LLM_MODEL} 모델에 첫 번째 청크를 주입하여 Entity와 Relation을 추출합니다...")
     
     try:
         # LLM 초기화 (Structured Output을 사용하여 Pydantic 스키마 형태의 결과를 강제함)
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", api_key=google_api_key)
+        llm = ChatGoogleGenerativeAI(model=LLM_MODEL, api_key=google_api_key)
         structured_llm = llm.with_structured_output(GraphData)
         
         # Pydantic 기반으로 작성했던 프롬프트 생성 (여기서는 시스템/유저가 합쳐진 형태를 사용)
@@ -87,7 +88,8 @@ def main():
             loader = Neo4jLoader()
             if loader.driver:
                 try:
-                    loader.load_graph_data(resolved_graph)
+                    loader.create_vector_index()
+                    loader.load_graph_data(resolved_graph, chunk_text=chunks[0])
                     loader.close()
                     print("🎉 (성공) Neo4j 데이터베이스에 추출된 노드와 엣지 적재가 완료되었습니다!")
                 except Exception as db_err:

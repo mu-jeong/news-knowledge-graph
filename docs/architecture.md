@@ -4,56 +4,104 @@
 
 ---
 
+## 🗺️ 지식 그래프 온톨로지
+
+프로젝트에서 사용하는 Neo4j 노드/관계 스키마는 아래 온톨로지 다이어그램을 참고하세요.
+
+![Ontology](ontology.png)
+
+---
+
+## 🤖 Graph RAG Agent Workflow (LangGraph)
+
+프로젝트의 핵심 검색 엔진은 `LangGraph`를 통해 구성된 다중 경로(Multi-path) 에이전트 아키텍처를 가집니다. 사용자의 질문 의도에 따라 가장 적합한 검색 전략을 동적으로 선택합니다.
+
+![LangGraph Workflow](hybrid_rag_graph.png)
+
+---
+
 ## 🏗️ 1. High-Level Architecture Overview
 
 시스템은 유지보수성과 확장성을 보장하기 위해 각 역할이 명확히 분리된 **디커플링(Decoupling)** 아키텍처를 따르고 있습니다. 전반적인 데이터 흐름은 다음과 같습니다.
 
-1. **Data Ingestion (크롤링):** 다양한 출처(뉴스, 공시 등)에서 비정형 텍스트 데이터를 수집 및 청킹(Chunking)합니다. 영문 기사는 LLM을 통해 한국어로 자동 번역합니다.
-2. **Entity Resolution (정규화 및 필터링):** 수집된 데이터에서 엔티티(기업, 인물, 기술 등)를 추출하고 동의어를 표준어로 병합합니다.
-3. **Graph Construction (증분 적재):** 정제된 엔티티와 관계(Edge) 데이터를 Pydantic 스키마 기반으로 검증한 후 Neo4j에 **MERGE 방식으로 누적 적재**합니다. 동일 키워드를 재검색할 경우 마지막 처리 기사 이후의 신규 기사만 처리합니다(Incremental Update).
-4. **Visualization & Analytics (시각화 및 분석):** 대시보드 상에서 물리적 연결망을 시각화하고, PageRank 알고리즘을 통해 핵심 테마를 추출하거나 기간 필터링을 통해 시계열적 변화를 추적합니다. 부수적으로 자연어 질문을 Cypher 쿼리로 변환하여 응답하는 Graph RAG 채팅 인터페이스도 제공합니다.
+1. **Data Ingestion (크롤링):** 신뢰 언론사(화이트리스트) 기사만 선별 수집합니다. 수집 기간은 달력 일(日) 기준으로, 1일이면 '오늘', 5일이면 '오늘 포함 과거 5일'입니다. (최대 100일)
+2. **Watermark 기반 증분 처리:** 각 키워드별로 날짜별 마지막 수집 시각(Watermark)을 Neo4j에 저장합니다. 재검색 시 이미 수집 완료된 날짜는 건너뛰고, 부분 수집된 날짜(당일 등)는 해당 시각 이후 기사만 신규 수집합니다.
+3. **Deduplication & Filtering:** TF-IDF + 코사인 유사도 기반으로 날짜별 유사 기사를 제거하고, 하루 최대 기사 수를 초과 시 균등 샘플링합니다.
+4. **Article-level Batch 처리:** 기사 10개 단위로 배치를 구성하며, 각 기사에 `[Article_1]` ~ `[Article_N]` 형태의 고유 ID를 부여하여 LLM이 출처 추적이 가능한 구조화된 추출을 수행합니다.
+5. **Entity Resolution (정규화):** 추출된 엔티티의 동의어를 `entity_aliases.json` 매핑 규칙으로 표준어로 병합합니다.
+6. **Graph Construction (증분 적재):** 정제된 엔티티와 관계 데이터를 Neo4j에 **MERGE 방식으로 누적 적재**합니다. 실제로 수집된 기사의 날짜만 워터마크로 기록합니다.
+7. **Visualization & Analytics (시각화 및 분석):** 날짜 필터를 그래프 데이터베이스 쿼리에 직접 반영하여, 선택한 기간 내 기사에서 추출된 관계만 그래프로 시각화합니다.
+8. **Graph RAG 챗봇:** 자연어 질문을 받아 Vector 검색 / Text-to-Cypher / Hybrid 방식으로 지식 그래프에서 정답을 검색하고, 실제 인용된 기사 링크만 정밀하게 출처로 첨부합니다.
 
 ---
 
 ## 📦 2. Core Modules & Directory Structure
 
-프로젝트의 핵심 디렉토리 및 모듈별 역할은 다음과 같습니다.
-
 ### `src/configs/` (Layer 1: Config & Schema)
+
 * **`schema.py`:** `Pydantic`을 활용하여 추출될 그래프 데이터의 스키마(`Entity`, `Relation`, `GraphData`)를 엄격하게 정의합니다.
-* 이를 통해 LLM(대형 언어 모델)의 환각(Hallucination) 현상을 방지하고, 항상 정규화된 JSON 포맷의 출력을 강제하여 파이프라인의 안정성을 보장합니다.
-* **`settings.py`:** 파이프라인 전체에서 사용하는 **모든 튜닝 파라미터를 한 곳에서 관리**합니다. 코드를 수정하지 않고 이 파일만 변경하면 동작을 조정할 수 있습니다.
-  * LLM 모델명 (`LLM_MODEL`), 병렬 호출 수 (`LLM_MAX_WORKERS`), 청크 크기 (`CHUNK_SIZE`)
+  * 추출 대상 엔티티 타입: `Company`, `Industry`, `MacroEvent`, `Product`
+  * LLM 환각(Hallucination) 방지 및 정규화된 JSON 출력 강제
+* **`settings.py`:** 파이프라인 전체에서 사용하는 **모든 튜닝 파라미터를 한 곳에서 관리**합니다.
+  * LLM 모델명 (`LLM_MODEL`), 병렬 호출 수 (`LLM_MAX_WORKERS`), 배치 크기 (`BATCH_SIZE`)
   * 페이지네이션 기준 (`DAYS_BACK_PER_PAGE`, `MAX_PAGES`)
   * 유사 기사 필터 (`MAX_ARTICLES_PER_DAY`, `SIMILARITY_THRESHOLD`)
   * 그래프 표시 설정 (`GRAPH_QUERY_LIMIT`, `GRAPH_HOP_DEPTH`)
+* **`entity_aliases.json`:** 엔티티 동의어 매핑 규칙을 코드 외부의 JSON 파일로 관리합니다. 코드 수정 없이 새로운 매핑을 추가할 수 있습니다.
 
 ### `src/core/crawlers/` (Layer 2: Data Crawlers)
-* **`base_provider.py`:** 향후 Bloomberg, Yahoo Finance, DART 등 다양한 데이터 프로바이더를 수용할 수 있도록 `fetch_data` / `cluster_data` 추상 인터페이스를 정의합니다.
+
+* **`base_provider.py`:** Bloomberg, Yahoo Finance, DART 등 다양한 데이터 프로바이더를 수용할 수 있도록 `fetch_data` / `cluster_data` 추상 인터페이스를 정의합니다.
 * **`naver_news.py`:** 네이버 뉴스 API 구현체입니다. 주요 기능은 다음과 같습니다.
-  * `fetch_data(since_date=)`: `settings.DAYS_BACK_PER_PAGE`(기본 3일)당 1페이지(100건)씩 페이지네이션 요청을 수행합니다 (최대 `MAX_PAGES`=10페이지). `since_date` 이후 기사만 필터링하여 증분 업데이트에 활용합니다.
-  * `filter_similar_articles()`: 날짜별로 기사를 묶고, 제목 유사도(`SequenceMatcher`) ≥ `SIMILARITY_THRESHOLD`(기본 0.6)인 기사를 중복으로 판별해 제거합니다. 중복 제거 후에도 하루 `MAX_ARTICLES_PER_DAY`(기본 30건)를 초과하면 균등 샘플링합니다.
-  * `cluster_data()`: 기사를 N개씩 묶어 하나의 텍스트 청크로 병합합니다. 영문 기사는 LLM(Gemini)으로 한국어 번역 후 청크에 포함합니다.
-  * `get_article_metadata()`: URL / 제목 / 발행일 메타데이터를 추출하여 Neo4j Article 노드 저장에 활용합니다.
+  * `ALLOWED_NEWS_DOMAINS`: 수집 허용 언론사 도메인 화이트리스트 (`chosun.com`, `yna.co.kr`, `hankyung.com` 등).
+  * **달력 일(日) 기반 수집 범위:** `days_back=1`이면 오늘 0시부터, `days_back=5`이면 4일 전(오늘 포함 5일) 0시부터 수집을 시작합니다. 최대 100일까지 설정 가능합니다.
+  * **워터마크 기반 증분 처리:** 애플리케이션(`app.py`)에서 이미 수집된 날짜의 정확한 시각이 전달되면, 그 시각 이후에 발행된 기사만 신규 수집합니다.
+  * `filter_similar_articles()`: 날짜별로 기사를 묶고, 제목 TF-IDF 코사인 유사도 ≥ `SIMILARITY_THRESHOLD`(기본 0.5)인 기사를 중복으로 판별합니다. 중복 제거 후에도 하루 `MAX_ARTICLES_PER_DAY`(기본 100건) 초과 시 균등 샘플링합니다.
+  * `cluster_data(batch_size=10)`: 허용 도메인 기사만 포함하고 영문 기사를 제외한 후, 10개씩 묶어 하나의 텍스트 배치(Batch)로 병합합니다. 각 기사에는 `[Article_1]`~`[Article_N]` 형태의 고유 ID를 부여하여 LLM이 출처를 명확히 추적할 수 있도록 합니다.
+  * `get_article_metadata()`: URL / 제목 / 발행일 메타데이터를 추출하여 Neo4j `NewsArticle` 노드 저장에 활용합니다.
 
 ### `src/core/utils/` (Layer 3: Data Processing & Entity Resolution)
+
 * **`entity_resolution.py`:** 데이터의 파편화를 막기 위한 핵심 모듈입니다. '삼전', '삼성물산', 'Samsung' 등 다양한 형태로 등장하는 엔티티를 하나의 일관된 표준어로 정규화합니다.
-* **[진화 방향 - 하이브리드 파이프라인]** 단순 사전(Dictionary) 매핑을 넘어, 1차 임베딩 기반 군집화 → 2차 sLM/LLM 기반 검증 → 3차 동적 캐싱(Dynamic Dictionary)을 통해 비용 효율적인 엔터프라이즈 엔티티 정규화를 수행할 예정입니다.
+  * 매핑 규칙은 코드가 아닌 `src/configs/entity_aliases.json`에서 외부 로드합니다.
 
 ### `src/graphs/` (Layer 4: Graph Database & RAG)
-* **`neo4j_manager.py`:** Neo4j 적재를 담당하는 핵심 클래스입니다. 주요 기능은 다음과 같습니다.
-  * `get_last_article_date(keyword)`: 해당 키워드로 마지막 처리된 기사의 날짜를 반환합니다. 증분 업데이트의 기준점입니다.
-  * `upsert_articles(keyword, articles)`: 처리된 기사를 `Article` 노드로 저장하고 `Keyword` 노드와 연결합니다. `Keyword.last_updated`는 파이프라인 실행 시각이 아닌 **실제 기사의 최신 발행일(`max(published_at)`)**로 기록합니다.
-  * `load_graph_data(graph_data)`: 추출된 Entity/Relation을 MERGE 방식으로 적재합니다.
-* **`graph_rag_bot.py`:** 사용자의 자연어 질문을 LangChain의 `GraphCypherQAChain`을 활용해 Neo4j에서 실행 가능한 **Cypher 쿼리로 변환(Text-to-Cypher)**합니다.
+
+* **`neo4j_manager.py`:** Neo4j 적재를 담당하는 핵심 클래스입니다.
+  * `get_keyword_watermarks(keyword)`: 키워드별 날짜별 마지막 수집 시각(Watermark)을 JSON 문자열로 반환합니다. 증분 처리의 기준점으로 사용됩니다.
+  * `update_keyword_watermarks(keyword, watermarks)`: 수집이 완료된 기사의 실제 발행일을 기준으로 날짜별 워터마크를 갱신합니다. **실제로 기사를 수집한 날짜만** 업데이트하여 미래 재검색 시 누락이 발생하지 않도록 합니다.
+  * `upsert_articles(keyword, articles)`: 기사를 `NewsArticle` 노드로 저장하고 `Keyword` 노드와 연결합니다.
+  * `load_graph_data(graph_data, batch_text)`: LLM 추출 엔티티/관계를 MERGE 방식으로 적재하고 `NewsBatch` 노드를 생성하여 원본 기사(`NewsArticle`)와 `[:HAS_SOURCE]` 관계로 연결합니다.
+  * `create_vector_index()`: `NewsBatch` 노드의 임베딩을 저장하는 벡터 인덱스(`batch_embedding`, 3072차원)를 생성합니다.
+* **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), 차업 횟수(`retry_count`), 검증 실패 시 에러 메시지(`final_answer`)를 포함하여 전체 워크플로우의 상태를 관리합니다.
+* **`hybrid_rag.py`:** `router`를 필두로 Vector / Text-to-Cypher / Hybrid(Entity-based) 3가지 검색 경로를 가진 LangGraph 기반 RAG 에이전트입니다. `MemorySaver`를 통해 대화 기록을 보존하며, **text2cypher 경로에는 `cypher_validator` 노드를 반드시 거쳐 Cypher Injection 및 문법 오류를 차단합니다.**
+
+### `src/nodes/` (Layer 4-1: RAG Retriever & Generator)
+
+* **`router.py`:** 사용자의 자연어 질문을 분석하여 어떤 검색 경로(`vector`, `text2cypher`, `vector_cypher`)를 사용할지 결정하는 분류기(Classifier) 노드입니다.
+* **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다.
+  * `vector_retriever_node`: `batch_embedding` 벡터 인덱스를 이용한 유사도 검색. 주로 일반적인 지식 질문에 유리합니다.
+  * `text2cypher_retriever_node`: LLM이 자연어 → Cypher 변환 후 Neo4j 직접 쿼리. 관계형 추론이 필요한 질문에 유리합니다. → 반드시 `cypher_validator`를 거칩니다.
+  * `vector_cypher_retriever_node`: 엔티티 기반 Hybrid 검색. 벡터 검색과 정밀 쿼리를 결합합니다.
+* **`cypher_validator.py`:** (필수 보안 노드) `text2cypher_retriever`가 생성한 Cypher 쿼리를 실행 전에 2단계로 검증합니다.
+  * **블랙리스트 검사:** `DELETE`, `DETACH`, `DROP`, `REMOVE`, `FOREACH`, `apoc.*` 등 파괴적/변조 명령어 즉시 차단
+  * **Neo4j 문법 검사:** `EXPLAIN {query}`로 실제 데이터를 읽지 않고 서버에서 문법 사전 검증
+  * **피드백 루프:** 검증 실패 시 `retry_count < 3`이면 `text2cypher_retriever`로 돌아가 재시도, `retry_count >= 3`이면 `generator` 없이 `final_answer`에 에러 메시지를 담아 즉시 종료
+* **`generator.py`:** 검색된 컨텍스트를 바탕으로 답변을 생성합니다.
+  * 각 배치에 부여된 `[Article_N]` ID를 활용하여, 각 답변 문장 끝에 `[출처: Article_N]`을 표기하도록 프롬프트를 강제합니다.
+  * **정밀 출처 표기:** 답변에 실제로 인용된 기사의 링크만 골라 `🔗 참조 뉴스 링크` 섹션에 표시합니다. 수십 개의 무관한 링크가 나열되던 문제를 해결합니다.
+  * ⚠️ `cypher_validator`가 `final_answer`를 설정한 경우 `generator`는 실행되지 않고 마명합니다.
 
 ### `apps/gui/` (Layer 5: User Interface & Analytics)
+
 * **`app.py`:** Streamlit과 Pyvis를 활용하여 구축된 대화형 그래프 시각화 대시보드입니다.
-  * **증분 파이프라인:** 검색 버튼 클릭 시 `[0/4] 증분 기준 조회 → [1/4] 신규 기사 수집 → [2/4] LLM 추출 → [3/4] 정규화 → [4/4] 누적 적재` 순으로 진행됩니다.
-  * **다중 필터 기반 뷰:** 노드/엣지 유형을 고를 수 있고, `NetworkX` 기반의 **PageRank**로 핵심 허브 노드 상위 N%만 추려내어 가독성을 높입니다.
-  * **시계열 연결망 뷰:** 기간 필터(Date Picker)를 통해, 지정된 날짜 사이에 발행된 데이터 엣지만 분리하여 특정 시점(Time-series)의 지식 연결망을 검증할 수 있습니다.
-  * **엣지 스타일 & 직관적 UI:** 기사 출처가 존재하는 엣지는 **밝은 실선 및 🔗 라벨**로, 기사 출처가 없는 엣지는 **어두운 회색 점선**으로 분리하여 노이즈를 식별하고 빠르게 원문으로 넘어갈 수 있게 돕습니다.
-  * **`GRAPH_HOP_DEPTH`-hop BFS 필터:** 검색어를 기준으로 지정된 단계 이내로 연결된 노드/엣지만 표시하여 관련도 높은 정보에 집중합니다.
+  * **레이아웃:** 상단에 지식 그래프, 하단에 Graph RAG 채팅창을 수직 배치합니다.
+  * **증분 파이프라인:** `[0/4] 워터마크 조회 → [1/4] 신규 기사 수집 → [2/4] LLM 추출 → [3/4] 정규화 → [4/4] 누적 적재`
+  * **달력 일(日) 기반 수집:** 1일=오늘, 5일=오늘 포함 과거 5일 기준으로 직관적으로 수집 범위를 설정합니다. (최대 100일)
+  * **엄격한 날짜 필터 기반 그래프:** 날짜 필터(Date Picker)를 변경하면 해당 기간 내 기사에서 추출된 관계만 Neo4j에 직접 쿼리하여 그래프에 표시합니다. (날짜 외 조건으로 인한 오염 없음)
+  * **다중 필터 기반 뷰:** 노드/엣지 유형 필터, `NetworkX` 기반 PageRank 상위 N% 필터
+  * **채팅 내역 정렬:** 질문-답변을 한 세트로 묶어, 최신 대화 세트가 위에 표시됩니다.
+  * **정밀 출처 링크:** RAG 답변에서 실제로 인용된 기사의 URL만 `🔗 참조 뉴스 링크` 섹션으로 자동 첨부합니다.
 
 ---
 
@@ -64,31 +112,42 @@
 | 파라미터 | 기본값 | 설명 |
 |---|---|---|
 | `LLM_MODEL` | `gemini-2.5-flash` | LLM 모델명 |
-| `LLM_MAX_WORKERS` | `5` | 병렬 LLM API 호출 수 |
-| `CHUNK_SIZE` | `20` | LLM 1회 호출당 기사 묶음 크기 |
+| `LLM_MAX_WORKERS` | `5` | 병렬 LLM API 호출 수 (ThreadPoolExecutor) |
+| `BATCH_SIZE` | `10` | LLM 1회 호출당 기사 묶음(배치) 크기. 기사별 `[Article_N]` ID 부여로 출처 추적 강화 |
 | `DEFAULT_DAYS_BACK` | `1` | UI 기본 수집 기간(일) |
 | `DAYS_BACK_PER_PAGE` | `3` | 페이지당 기준 일수 (3일=1페이지=100건) |
 | `MAX_PAGES` | `10` | 최대 수집 페이지 (상한 1,000건) |
-| `MAX_ARTICLES_PER_DAY` | `30` | 날짜별 최대 기사 수 (유사 필터 후) |
-| `SIMILARITY_THRESHOLD` | `0.6` | 제목 유사도 임계값 (이상이면 중복 판별) |
+| `MAX_ARTICLES_PER_DAY` | `100` | 날짜별 최대 기사 수 (유사 필터 후) |
+| `SIMILARITY_THRESHOLD` | `0.5` | 제목 TF-IDF 코사인 유사도 임계값 |
 | `GRAPH_QUERY_LIMIT` | `500` | Neo4j 조회 최대 엣지 수 |
 | `GRAPH_HOP_DEPTH` | `3` | 검색어 기준 표시 홉(Hop) 깊이 |
-| `PAGERANK_DEFAULT_TOP` | `40` | 그래프 표시 시 PageRank 기준 상위 % (하위 노드 숨김) |
+| `PAGERANK_DEFAULT_TOP` | `50` | 그래프 표시 시 PageRank 기준 상위 % |
 
+---
+
+## 🗄️ 4. Neo4j 데이터 스키마
 
 ```
 (:Keyword {name, last_updated})
     │
-    └──[:HAS_ARTICLE]──▶ (:Article {url, title, published_at, keyword})
-
-(:Company / :Person / :Technology / :Product / :Country)
-    └──[:RELATION_TYPE {description, source_article, source_url}]──▶ (:Entity)
+    └──[:HAS_ARTICLE]──▶ (:NewsArticle {id=url, url, title, published_at, keyword})
+                                ▲
+                                │ [:HAS_SOURCE]
+                         (:NewsBatch {id, text, embedding})
+                                │
+                                 └──[:MENTIONS]──▶ (:Entity / :Company / :Industry / :MacroEvent / :Product)
+                                                        │
+                                              [:RELATION_TYPE {description, source_article, source_url, source_batch_id}]
+                                                        │
+                                                        ▼
+                                                   (:Entity)
 ```
 
 | 노드 | 속성 | 역할 |
 |------|------|------|
-| `Keyword` | `name`, `last_updated` | 검색어 추적, 마지막 처리 시각 기록 |
-| `Article` | `url`(PK), `title`, `published_at`, `keyword` | 기사 중복 방지 + 증분 기준점 |
-| `Entity` 계열 | `id`(PK=name), `name` | 키워드 무관 공유 → 크로스-키워드 분석 가능 |
+| `Keyword` | `name`, `last_updated`, `watermarks` | 검색어 추적, 날짜별 마지막 수집 시각(Watermark) 기록 |
+| `NewsArticle` | `id`(PK=url), `url`, `title`, `published_at`, `keyword` | 기사 중복 방지 + 증분 기준점 |
+| `NewsBatch` | `id`, `text`, `embedding` | LLM 입력 텍스트 배치 (10개 기사). 벡터 검색의 단위. |
+| `Entity` 계열 | `id`(PK=name), `name` | `Company`, `Industry`, `MacroEvent`, `Product` 타입 포함. 키워드 무관 공유 → 크로스-키워드 분석 |
 
 ---

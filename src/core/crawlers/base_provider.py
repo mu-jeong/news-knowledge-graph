@@ -15,6 +15,6 @@ class BaseDataProvider(ABC):
 
     @abstractmethod
     def cluster_data(self, raw_data: List[Dict[str, Any]]) -> List[str]:
-        """비용을 줄이기 위해 원시 데이터를 청크(Chunk)로 클러스터링합니다."""
+        """비용을 줄이기 위해 원시 데이터를 배치(Batch)로 클러스터링합니다."""
         pass
 
