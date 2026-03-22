@@ -102,7 +102,7 @@ def run_pipeline(keyword: str, days_back: int = 7):
         yield "\n".join(log)
         return
 
-    log.append(f"  → 📡 {len(all_urls)}개 기사 중 **진짜 신규 {len(article_metadata)}개** 발견 (나머지 중복은 제외)")
+    log.append(f"  → 📡 {len(all_urls)}개 기사 중 **신규 {len(article_metadata)}개** 발견 (나머지 중복은 제외)")
     log.append(f"\n🤖 **[2/4] LLM 병렬 추출 시작...** ({len(batches)}개 배치 동시 요청)")
     yield "\n".join(log)
 
@@ -643,7 +643,7 @@ except Exception as e:
 # Agentic Chat (Graph RAG) 구현
 # ─────────────────────────────
 st.divider()
-st.header("🔍 지식 기반 스마트 검색")
+st.header("🔍 지식 그래프 기반 검색")
 
 import uuid
 from src.graphs.hybrid_rag import rag_app
@@ -711,6 +711,6 @@ with chat_container:
     for msg_set in reversed(chat_sets):
         for msg in msg_set:
             with st.chat_message(msg["role"]):
-                st.markdown(msg["content"])
+                st.markdown(msg["content"], unsafe_allow_html=True)
                 if msg.get("route"):
                     st.caption(f"🛣️ 검색 경로 판단: `{msg['route']}`")
