@@ -31,7 +31,7 @@
 5. **Entity Resolution (정규화):** 추출된 엔티티의 동의어를 `entity_aliases.json` 매핑 규칙으로 표준어로 병합합니다.
 6. **Graph Construction (증분 적재):** 정제된 엔티티와 관계 데이터를 Neo4j에 **MERGE 방식으로 누적 적재**합니다. 실제로 수집된 기사의 날짜만 워터마크로 기록합니다.
 7. **Visualization & Analytics (시각화 및 분석):** 날짜 필터를 그래프 데이터베이스 쿼리에 직접 반영하여, 선택한 기간 내 기사에서 추출된 관계만 그래프로 시각화합니다.
-8. **Graph RAG 챗봇:** 자연어 질문을 받아 Vector 검색 / Text-to-Cypher / Hybrid 방식으로 지식 그래프에서 정답을 검색하고, 실제 인용된 기사 링크만 정밀하게 출처로 첨부합니다.
+8. **Graph RAG 챗봇:** 자연어 질문을 받아 Vector / Text-to-Cypher / Hybrid 방식으로 지식 그래프를 검색합니다. 검색된 `NewsBatch` 노드와 연결된 `NewsArticle` 노드에서 URL을 직접 추출하여 **[참조 링크 매핑 테이블]**을 생성하고, 전역적 기사 번호를 동적 재부여(Dynamic Re-indexing)하여 100% 정확한 출처 정보를 제공합니다.
 
 ---
 
@@ -73,23 +73,23 @@
   * `upsert_articles(keyword, articles)`: 기사를 `NewsArticle` 노드로 저장하고 `Keyword` 노드와 연결합니다.
   * `load_graph_data(graph_data, batch_text)`: LLM 추출 엔티티/관계를 MERGE 방식으로 적재하고 `NewsBatch` 노드를 생성하여 원본 기사(`NewsArticle`)와 `[:HAS_SOURCE]` 관계로 연결합니다.
   * `create_vector_index()`: `NewsBatch` 노드의 임베딩을 저장하는 벡터 인덱스(`batch_embedding`, 3072차원)를 생성합니다.
-* **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), 차업 횟수(`retry_count`), 검증 실패 시 에러 메시지(`final_answer`)를 포함하여 전체 워크플로우의 상태를 관리합니다.
+* **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), 재시도 횟수(`retry_count`), 검증 실패 시 에러 메시지(`final_answer`), 그리고 **기사 ID와 URL 매핑 테이블(`source_links`)**을 관리합니다.
 * **`hybrid_rag.py`:** `router`를 필두로 Vector / Text-to-Cypher / Hybrid(Entity-based) 3가지 검색 경로를 가진 LangGraph 기반 RAG 에이전트입니다. `MemorySaver`를 통해 대화 기록을 보존하며, **text2cypher 경로에는 `cypher_validator` 노드를 반드시 거쳐 Cypher Injection 및 문법 오류를 차단합니다.**
 
 ### `src/nodes/` (Layer 4-1: RAG Retriever & Generator)
 
 * **`router.py`:** 사용자의 자연어 질문을 분석하여 어떤 검색 경로(`vector`, `text2cypher`, `vector_cypher`)를 사용할지 결정하는 분류기(Classifier) 노드입니다.
-* **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다.
-  * `vector_retriever_node`: `batch_embedding` 벡터 인덱스를 이용한 유사도 검색. 주로 일반적인 지식 질문에 유리합니다.
+* **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다. 모든 리트리버는 검색된 텍스트 배치(`NewsBatch`)와 관계된 기사(`NewsArticle`)의 URL을 Neo4j에서 직접 가져와 `_prepare_search_context`를 통해 전역적으로 고유한 번호를 매기고 매핑 테이블을 생성합니다.
+  * `vector_retriever_node`: `batch_embedding` 벡터 인덱스 검색 시 `[:HAS_SOURCE]` 관계를 JOIN하여 URL을 함께 리턴합니다.
   * `text2cypher_retriever_node`: LLM이 자연어 → Cypher 변환 후 Neo4j 직접 쿼리. 관계형 추론이 필요한 질문에 유리합니다. → 반드시 `cypher_validator`를 거칩니다.
-  * `vector_cypher_retriever_node`: 엔티티 기반 Hybrid 검색. 벡터 검색과 정밀 쿼리를 결합합니다.
+  * `vector_cypher_retriever_node`: 엔티티 기반 Hybrid 검색. 특정 엔티티를 포함하는 배치와 기사 URL을 최우선으로 리턴합니다.
 * **`cypher_validator.py`:** (필수 보안 노드) `text2cypher_retriever`가 생성한 Cypher 쿼리를 실행 전에 2단계로 검증합니다.
   * **블랙리스트 검사:** `DELETE`, `DETACH`, `DROP`, `REMOVE`, `FOREACH`, `apoc.*` 등 파괴적/변조 명령어 즉시 차단
   * **Neo4j 문법 검사:** `EXPLAIN {query}`로 실제 데이터를 읽지 않고 서버에서 문법 사전 검증
   * **피드백 루프:** 검증 실패 시 `retry_count < 3`이면 `text2cypher_retriever`로 돌아가 재시도, `retry_count >= 3`이면 `generator` 없이 `final_answer`에 에러 메시지를 담아 즉시 종료
-* **`generator.py`:** 검색된 컨텍스트를 바탕으로 답변을 생성합니다.
-  * 각 배치에 부여된 `[Article_N]` ID를 활용하여, 각 답변 문장 끝에 `[출처: Article_N]`을 표기하도록 프롬프트를 강제합니다.
-  * **정밀 출처 표기:** 답변에 실제로 인용된 기사의 링크만 골라 `🔗 참조 뉴스 링크` 섹션에 표시합니다. 수십 개의 무관한 링크가 나열되던 문제를 해결합니다.
+* **`generator.py`:** 검색된 컨텍스트와 **[참조 링크 매핑 테이블]**을 바탕으로 답변을 생성합니다.
+  * 각 배치에 새로 부여된 고유 ID(`[Article_1]`~`[Article_N]`)를 활용하여 각 문장 끝에 출처를 표기합니다.
+  * **정밀 출처 표기:** LLM은 제공된 매핑 테이블을 참고하여 HTML 링크(`<a href="..." target="_blank">[출처]</a>`)를 답변에 직접 삽입함으로써 정보의 투명성을 극대화합니다.
   * ⚠️ `cypher_validator`가 `final_answer`를 설정한 경우 `generator`는 실행되지 않고 마명합니다.
 
 ### `apps/gui/` (Layer 5: User Interface & Analytics)
