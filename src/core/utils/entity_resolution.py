@@ -1,5 +1,6 @@
 import math
 import os
+import re
 from typing import Dict, List, Optional, Tuple
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -30,9 +31,161 @@ class EntityResolver:
         "VULNERABLE_TO": "EXPOSED_TO",
         "AFFECTED_BY": "EXPOSED_TO",
         "IMPACTED_BY": "EXPOSED_TO",
+        "IMPACTS": "AFFECTS",
         "USED_IN": "USES",
+        "USED_BY": "USES",
+        "POWERED_BY": "USES",
+        "ENABLED_BY": "USES",
         "USES_TECH": "USES",
         "BELONGS_IN": "BELONGS_TO",
+        "BELONG_TO": "BELONGS_TO",
+        "IS_A": "PART_OF",
+        "KIND_OF": "PART_OF",
+        "CATEGORY_OF": "PART_OF",
+        "SUBCATEGORY_OF": "PART_OF",
+        "PARTOF": "PART_OF",
+        "RELEASES": "RELEASED",
+        "BENEFITS": "BENEFITS_FROM",
+        "BENEFITED_FROM": "BENEFITS_FROM",
+    }
+
+    GENERIC_ENTITY_EXACT = {
+        "기술 기업",
+        "플랫폼 기업",
+        "서비스 업체",
+        "제조 업체",
+        "주요 기업",
+        "주요 업체",
+        "관련 업계",
+        "관련 산업",
+    }
+
+    GENERIC_ENTITY_SUFFIXES = (
+        "기업",
+        "업체",
+        "업계",
+        "산업",
+        "분야",
+        "영역",
+        "섹터",
+        "시장",
+        "생태계",
+        "밸류체인",
+        "커뮤니티",
+    )
+
+    GENERIC_ENTITY_PREFIXES = (
+        "주요 ",
+        "글로벌 ",
+        "국내 ",
+        "해외 ",
+        "지역 ",
+        "현지 ",
+        "일부 ",
+        "복수의 ",
+    )
+
+    GENERIC_ENTITY_TOKENS = {
+        "기술",
+        "플랫폼",
+        "서비스",
+        "제조",
+        "기업",
+        "업체",
+        "업계",
+        "산업",
+        "분야",
+        "영역",
+        "섹터",
+        "시장",
+        "생태계",
+        "밸류체인",
+        "주요",
+        "글로벌",
+        "국내",
+        "해외",
+        "지역",
+        "현지",
+        "일부",
+        "복수의",
+        "커뮤니티",
+    }
+
+    INSTITUTION_SUFFIXES = (
+        "부",
+        "청",
+        "처",
+        "위원회",
+        "협회",
+        "조합",
+        "센터",
+        "기관",
+    )
+
+    TYPE_KEYWORDS = {
+        "Technology": (
+            "AI",
+            "인공지능",
+            "LLM",
+            "소프트웨어",
+            "플랫폼",
+            "기술",
+            "오픈소스",
+            "모델",
+            "시스템",
+            "프레임워크",
+            "프로토콜",
+            "알고리즘",
+            "자동화",
+            "디지털",
+        ),
+        "Industry": (
+            "산업",
+            "업계",
+            "생태계",
+            "공급망",
+            "밸류체인",
+            "섹터",
+            "분야",
+            "시장",
+        ),
+        "Product": (
+            "제품",
+            "서비스",
+            "기기",
+            "장치",
+            "솔루션",
+            "시리즈",
+            "모델",
+            "버전",
+            "에디션",
+            "패키지",
+        ),
+        "RiskFactor": (
+            "리스크",
+            "우려",
+            "압력",
+            "충돌",
+            "격화",
+            "캐즘",
+            "인하",
+            "둔화",
+            "불확실성",
+            "악화",
+            "쇼크",
+            "논란",
+        ),
+        "MacroEvent": (
+            "인플레이션",
+            "금리",
+            "환율",
+            "경기",
+            "경제",
+            "규제",
+            "정책",
+            "관세",
+            "원자재",
+        ),
     }
 
     def __init__(self, alias_dict: Dict[str, str] = None):
@@ -122,6 +275,31 @@ class EntityResolver:
             return ""
         return " ".join(str(name).replace("\n", " ").strip().split())
 
+    def _tokenize_name(self, name: str) -> List[str]:
+        return [token for token in re.split(r"[\s/·(),\-]+", name) if token]
+
+    def _is_generic_category_entity(self, name: str) -> bool:
+        if not name or name in self.taxonomy:
+            return False
+        if name in self.GENERIC_ENTITY_EXACT:
+            return True
+
+        if any(name.startswith(prefix) for prefix in self.GENERIC_ENTITY_PREFIXES) and any(
+            name.endswith(suffix) for suffix in self.GENERIC_ENTITY_SUFFIXES
+        ):
+            return True
+
+        tokens = self._tokenize_name(name)
+        if 1 < len(tokens) <= 4 and all(token in self.GENERIC_ENTITY_TOKENS for token in tokens):
+            return True
+
+        if len(tokens) <= 3 and any(name.endswith(suffix) for suffix in self.GENERIC_ENTITY_SUFFIXES):
+            non_generic_tokens = [token for token in tokens if token not in self.GENERIC_ENTITY_TOKENS]
+            if not non_generic_tokens:
+                return True
+
+        return False
+
     def _is_low_quality_entity(self, name: str) -> bool:
         if not name or len(name) < 2:
             return True
@@ -130,24 +308,35 @@ class EntityResolver:
             return True
         if name.count(" ") >= 5:
             return True
+        if self._is_generic_category_entity(name):
+            return True
         return False
 
     def _infer_type(self, name: str, declared_type: Optional[str]) -> str:
         if name in self.taxonomy:
             return self.taxonomy[name].get("type", "Entity")
+
+        if name.endswith(self.INSTITUTION_SUFFIXES):
+            return "Entity"
+
+        scores = {entity_type: 0 for entity_type in self.TYPE_KEYWORDS}
+        for entity_type, keywords in self.TYPE_KEYWORDS.items():
+            scores[entity_type] = sum(1 for keyword in keywords if keyword in name)
+
+        best_type, best_score = max(scores.items(), key=lambda item: item[1])
+        if best_score >= 1:
+            if declared_type in self._known_types and declared_type != "Entity":
+                declared_score = scores.get(declared_type, 0)
+                if declared_score == best_score:
+                    return declared_type
+            return best_type
+
         if declared_type in self._known_types:
             return declared_type
-
-        if any(keyword in name for keyword in ("AI", "LLM", "기술", "압축 기술", "플랫폼")):
-            return "Technology"
-        if any(keyword in name for keyword in ("리스크", "압력", "위기", "불확실성")):
-            return "RiskFactor"
-        if any(keyword in name for keyword in ("시장", "산업", "반도체", "파운드리")):
-            return "Industry"
         return "Entity"
 
     def _normalize_relation_type(self, relation_type: Optional[str]) -> str:
-        rel = self._clean_name(relation_type).replace(" ", "_").upper()
+        rel = self._clean_name(relation_type).replace("-", "_").replace(" ", "_").upper()
         if not rel:
             return "RELATED_TO"
         rel = self.RELATION_NORMALIZATION.get(rel, rel)

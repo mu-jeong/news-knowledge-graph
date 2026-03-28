@@ -30,7 +30,7 @@ RELATION_TYPES = (
 # 1. Pydantic 스키마 정의 (엄격한 JSON 구조 강제)
 # ----------------------------------------------------
 class Entity(BaseModel):
-    name: str = Field(description="엔티티의 이름 (예: 삼성전자, 반도체, 갤럭시 S24 등)")
+    name: str = Field(description="엔티티의 이름 (예: 기업명, 산업 분야, 기술명, 제품명 등)")
     type: str = Field(description="엔티티 카테고리 (Company, Industry, MacroEvent, Product, Technology, RiskFactor 중 선택)")
 
 class Relation(BaseModel):
@@ -67,12 +67,12 @@ def get_graph_extraction_prompt(batch_text: str) -> str:
         "   - 관계(Relation)를 추출할 때, 해당 관계가 발견된 기사의 [기사 ID]를 `article_id` 필드에 반드시 기입하십시오.\n\n"
 
         "2. [엔티티 정의]:\n"
-        "   - Company: 기업 (삼성전자, TSMC 등)\n"
-        "   - Industry: 산업/섹터 (반도체, 파운드리, 2차전지 등)\n"
-        "   - MacroEvent: 거시경제 요인 (금리 인상, 원자재 가격 상승 등)\n"
-        "   - Product: 제품/서비스 (갤럭시 S24, HBM3E, AI PC 등)\n"
-        "   - Technology: 기술/기술 영역 (AI, LLM, 메모리 압축 기술 등)\n"
-        "   - RiskFactor: 리스크/압박 요인 (물가 상승 압력, 성장 하방 리스크 등)\n\n"
+        "   - Company: 개별 기업 또는 사업 주체\n"
+        "   - Industry: 산업/섹터/시장/생태계 단위의 개념\n"
+        "   - MacroEvent: 경기, 정책, 금리, 환율 등 거시경제 이벤트나 외부 변수\n"
+        "   - Product: 개별 제품, 서비스, 제품군\n"
+        "   - Technology: 기술, 기술 영역, 기술 표준, 플랫폼\n"
+        "   - RiskFactor: 리스크, 압박 요인, 불확실성, 부정적 변수\n\n"
         
         "3. [관계 정의]:\n"
         "   - [Company] -SUPPLIES_TO-> [Company] (공급)\n"
@@ -88,6 +88,7 @@ def get_graph_extraction_prompt(batch_text: str) -> str:
         "4. [주의 사항]:\n"
         "   - 답변(Generation) 시 사용될 근거가 명확하도록 `source_url`과 `article_id`를 정확히 매칭하십시오.\n"
         "   - 기사 기반으로 확인되지 않은 관계를 임의로 만들지 마십시오.\n"
+        "   - '기술 기업', '완성차 업체', '모빌리티 기업'처럼 지나치게 일반적인 집합 명사는 가능하면 엔티티로 추출하지 말고, 구체적인 기업/제품/기술/리스크를 우선 추출하십시오.\n"
         "   - 출력값은 반드시 아래 JSON Schema를 완벽히 준수해야 합니다.\n\n"
         
         f"----- JSON SCHEMA -----\n{schema_json}\n-----------------------\n"

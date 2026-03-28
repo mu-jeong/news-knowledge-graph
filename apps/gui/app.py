@@ -82,12 +82,15 @@ def run_pipeline(keyword: str, days_back: int = 7):
             # 케이스 1: API에서 기사는 가져왔거나(all_urls), 워터마크에 의해 모두 필터링된 경우(watermarks)
             if all_urls or watermarks:
                 log.append(f"  → ✨ **이미 최신 지식이 반영되어 있습니다.** (금일 요청 범위에서 새로 발행된 기사가 없습니다.)")
-                log.append("  💡 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+                log.append("  💡 기존 그래프와 검색 컨텍스트를 그대로 사용합니다. 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+                log.append(f"\n🎉 **파이프라인 완료!** 기존 데이터를 기준으로 그래프를 표시합니다.")
+                yield "\n".join(log)
+                yield True
             # 케이스 2: API 결과 자체가 없고 기존 수집 이력도 없는 경우
             else:
                 log.append("  → ❌ **수집된 기사가 전혀 없습니다.** (키워드 오타, 네이버 서버 일시 오류, 혹은 수집 허용 언론사에 해당 뉴스가 없을 수 있음)")
-            
-            yield "\n".join(log)
+                yield "\n".join(log)
+                yield False
             return
              
         # 새로운 기사가 있다면 배치를 재생성 (원래 batches는 raw_articles 기준이므로 걸러야 함)
@@ -100,6 +103,7 @@ def run_pipeline(keyword: str, days_back: int = 7):
     except Exception as e:
         log.append(f"  → ⚠️ 수집 중 예외 발생: {e}")
         yield "\n".join(log)
+        yield False
         return
 
     log.append(f"  → 📡 {len(all_urls)}개 기사 중 **신규 {len(article_metadata)}개** 발견 (나머지 중복은 제외)")
@@ -177,11 +181,13 @@ def run_pipeline(keyword: str, days_back: int = 7):
         error_msg = f"  → ❌ 적재 오류: {e}\n\n```\n{traceback.format_exc()}\n```"
         log.append(error_msg)
         yield "\n".join(log)
-        return False # 실패 반환
+        yield False
+        return
 
     log.append(f"\n🎉 **파이프라인 완료!** 아래 그래프가 자동으로 갱신됩니다.")
     yield "\n".join(log)
-    return True # 성공 반환
+    yield True
+    return
 
 
 
@@ -408,10 +414,10 @@ if run_btn and search_input.strip():
     with st.spinner("파이프라인 실행 중..."):
         pipeline_success = False
         for log_msg in run_pipeline(keyword, days_back=int(days_input)):
+            if isinstance(log_msg, bool):
+                pipeline_success = log_msg
+                continue
             log_area.markdown(log_msg)
-            # 마지막 yield 값이 True/False라면 성공 여부 판단
-            if log_msg is True: pipeline_success = True
-            if log_msg is False: pipeline_success = False
 
     if pipeline_success:
         st.success("✅ 완료! 그래프가 아래에 표시됩니다.")
@@ -657,6 +663,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
+if "chat_scope_keyword" not in st.session_state:
+    st.session_state.chat_scope_keyword = ""
 
 # 1. 검색창을 상단에 배치 (고정된 느낌을 주기 위해 container 사용)
 input_container = st.container()
@@ -667,6 +675,16 @@ chat_container = st.container()
 
 # 입력 및 응답 생성 로직
 if prompt:
+    active_keyword = search_input.strip() if search_input else ""
+    if not active_keyword:
+        st.warning("질문 전에 먼저 검색어를 입력하고 그래프를 생성해 주세요.")
+        st.stop()
+
+    if st.session_state.chat_scope_keyword != active_keyword:
+        st.session_state.messages = []
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.chat_scope_keyword = active_keyword
+
     # 사용자 메시지 추가 (메시지 리스트의 맨 뒤에 추가하지만 출력은 역순으로 함)
     st.session_state.messages.append({"role": "user", "content": prompt})
     
@@ -676,7 +694,12 @@ if prompt:
             with st.spinner("AI가 최적의 검색 경로를 찾고 있습니다... 🔍"):
                 config = {"configurable": {"thread_id": st.session_state.thread_id}}
                 try:
-                    result = rag_app.invoke({"question": prompt, "retry_count": 0, "final_answer": None}, config=config)
+                    result = rag_app.invoke({
+                        "question": prompt,
+                        "current_keyword": active_keyword,
+                        "retry_count": 0,
+                        "final_answer": None
+                    }, config=config)
                     
                     # Cypher 검증 실패 시 final_answer에 에러 메시지가 담겨옴
                     final_answer = result.get("final_answer")
