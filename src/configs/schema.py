@@ -36,7 +36,7 @@ class Entity(BaseModel):
 class Relation(BaseModel):
     source: str = Field(description="관계를 시작하는 엔티티의 이름")
     target: str = Field(description="관계의 대상이 되는 엔티티의 이름")
-    type: str = Field(description="관계 타입 (SUPPLIES_TO, COMPETES_WITH, BELONGS_TO, PART_OF, RELEASED, USES, EXPOSED_TO, BENEFITS_FROM, AFFECTS, OWNS, RELATED_TO, MENTIONS 등)")
+    type: str = Field(description="관계 타입 (SUPPLIES_TO, COMPETES_WITH, BELONGS_TO, PART_OF, RELEASED, USES, EXPOSED_TO, BENEFITS_FROM, AFFECTS, OWNS, RELATED_TO, MENTIONS 등). 가능한 한 관리형 관계를 우선 사용하고, 애매한 경우에만 RELATED_TO를 사용")
     description: Optional[str] = Field(description="관계에 대한 구체적인 맥락", default=None)
     source_article: Optional[str] = Field(description="추출 원본 뉴스 제목", default=None)
     source_url: Optional[str] = Field(description="추출 원본 링크", default=None)
@@ -83,11 +83,15 @@ def get_graph_extraction_prompt(batch_text: str) -> str:
         "   - [Product/Company] -USES-> [Technology] (기술 활용)\n"
         "   - [Company/Product/Industry] -EXPOSED_TO-> [RiskFactor/MacroEvent] (리스크 노출)\n"
         "   - [Company/Product/Industry] -BENEFITS_FROM-> [MacroEvent/Technology] (수혜)\n"
-        "   - [MacroEvent/RiskFactor/Technology] -AFFECTS-> [Entity] (영향)\n\n"
-        
+        "   - [MacroEvent/RiskFactor/Technology] -AFFECTS-> [Entity] (영향)\n"
+        "   - [Entity] -RELATED_TO-> [Entity] 는 위 관계로 명확히 분류되지 않을 때만 사용합니다.\n\n"
+
         "4. [주의 사항]:\n"
         "   - 답변(Generation) 시 사용될 근거가 명확하도록 `source_url`과 `article_id`를 정확히 매칭하십시오.\n"
         "   - 기사 기반으로 확인되지 않은 관계를 임의로 만들지 마십시오.\n"
+        "   - 가능한 한 `RELATED_TO` 대신 더 구체적인 관리형 관계를 선택하십시오.\n"
+        "   - `BELONGS_TO`는 소속/분류, `PART_OF`는 상하위 포함 관계라는 차이를 유지하십시오.\n"
+        "   - `AFFECTS`, `EXPOSED_TO`, `BENEFITS_FROM`은 서로 다른 의미이므로 혼용하지 마십시오.\n"
         "   - '기술 기업', '완성차 업체', '모빌리티 기업'처럼 지나치게 일반적인 집합 명사는 가능하면 엔티티로 추출하지 말고, 구체적인 기업/제품/기술/리스크를 우선 추출하십시오.\n"
         "   - 출력값은 반드시 아래 JSON Schema를 완벽히 준수해야 합니다.\n\n"
         

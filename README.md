@@ -60,9 +60,17 @@
 
 ## 🗺️ 지식 그래프 온톨로지
 
-프로젝트가 추출하고 저장하는 노드·관계 구조(온톨로지)는 아래 다이어그램을 참고하세요.
+프로젝트가 추출하고 저장하는 노드·관계 구조(온톨로지)는 아래 다이어그램을 참고하세요. 현재 구조는 엔티티 타입 기반 저장 구조 위에 선택적 taxonomy 계층과 사용자 확장 레이어를 얹은 하이브리드 ontology입니다.
 
-![Ontology](docs/ontology.png)
+### 구조도
+
+![Ontology Structure](docs/ontology.png)
+
+### 운영 흐름도
+
+![Ontology Operation Flow](docs/ontology_operations.png)
+
+운영 흐름도의 핵심은 "taxonomy가 없어도 fallback 엔티티로 먼저 동작하고, 반복 등장한 개념만 나중에 사용자 taxonomy로 편입한다"는 점입니다.
 
 ### 🤖 Graph RAG Agent Workflow (LangGraph)
 
@@ -78,14 +86,17 @@
   - `Pydantic` 스키마 템플릿을 통해 LLM 환각(Hallucination)을 막고 엄격하게 파싱된 노드/엣지(Entity & Relation) 데이터를 추출합니다.
   - 추출 대상 엔티티: `Company`, `Industry`, `MacroEvent`, `Product`, `Technology`, `RiskFactor`
   - 관리형 관계 타입: `SUPPLIES_TO`, `COMPETES_WITH`, `BELONGS_TO`, `PART_OF`, `RELEASED`, `USES`, `EXPOSED_TO`, `BENEFITS_FROM`, `AFFECTS`, `OWNS`, `RELATED_TO`, `MENTIONS`
-  - 엔티티 정규화는 `entity_aliases.json`의 별칭 규칙과 `entity_taxonomy.json`의 canonical taxonomy를 함께 사용합니다.
+  - 엔티티 정규화는 `entity_aliases.json`의 별칭 규칙과 taxonomy 설정을 함께 사용합니다.
+  - `entity_taxonomy.json`은 공통 seed taxonomy만 유지하고, 사용자가 자유롭게 확장할 내용은 `entity_taxonomy.user.json`에 추가합니다.
+  - 코드 레벨에서는 taxonomy가 없어도 동작하는 fallback을 유지하고, taxonomy 미등록 엔티티는 `data/ontology_candidates.json`에 후보로 누적합니다.
 - **[Layer 2] Data Crawlers (`src/core/crawlers/`)**:
   - 신뢰 언론사 화이트리스트(`chosun.com`, `yna.co.kr`, `hankyung.com` 등) 기사만 선별합니다.
   - TF-IDF + 코사인 유사도 기반으로 중복 기사를 제거하고, 개별 기사의 본문을 정제하여 `NewsArticle` 노드에 직접 저장합니다. (`naver_news.py`)
   - **동적 기사 인덱싱**: 리트리버가 검색 순위별로 `[Article_1]`, `[Article_2]` 등으로 기사 번호를 실시간 부여하여 LLM의 출처 혼선을 방지합니다.
   - 수집 기간은 **달력 일(日) 기준**으로, 1일=오늘, 5일=오늘 포함 과거 5일. (최대 100일)
 - **[Layer 3] Data Processing (`src/core/utils/`)**:
-  - 파편화된 엔티티(예: '삼성', '삼전')를 `entity_aliases.json` 매핑 규칙으로 표준화하고, taxonomy 기반 상위 개념과 provenance를 함께 정리합니다. (`entity_resolution.py`)
+  - 파편화된 엔티티를 `entity_aliases.json` 매핑 규칙으로 표준화하고, seed taxonomy 및 사용자 확장 taxonomy를 함께 반영합니다. (`entity_resolution.py`)
+  - taxonomy가 없는 새 주제도 fallback 엔티티로 자연스럽게 유지하고, 반복 출현 시에만 parent 추천 후보를 기록합니다.
 - **[Layer 4] Graph Database & RAG (`src/graphs/`, `src/nodes/`)**:
   - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 적용하여 **검색어별로 누적 적재**합니다.
   - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)
@@ -156,11 +167,17 @@ streamlit run apps/gui/app.py
 
 ![Ontology](docs/ontology.png)
 
+![Ontology Operation Flow](docs/ontology_operations.png)
+
 | 노드 | 역할 |
 |------|------|
 | `Keyword` | 검색어 추적, 날짜별 마지막 수집 시각(Watermark) 저장 |
 | `NewsArticle` | 기사 URL(PK) 기준 중복 방지 + 증분 기준점 + 본문/임베딩 저장 + 벡터 검색(RAG)의 기본 단위 |
 | `Entity` 계열 | `Company`, `Industry`, `MacroEvent`, `Product`, `Technology`, `RiskFactor` 타입. taxonomy 관계와 기사 provenance를 함께 보존하며 키워드 무관 공유 → 크로스-키워드 분석 |
+
+> 엔티티 정제는 "재사용 가능한 개념은 유지하고, 문장 조각·일반 집합 명사·맥락 의존 설명은 제거한다"는 기준을 따릅니다. 자세한 허용/제거 기준은 `docs/architecture.md`의 `엔티티 허용/제거 기준` 섹션에 정리되어 있습니다.
+> generic 개념 노드는 `제거 / taxonomy로만 유지 / 기사 엔티티로 유지`로 나누어 관리합니다. 세부 정책은 `docs/architecture.md`의 `Generic Node 정책` 섹션에 정리되어 있습니다.
+> taxonomy는 공통 seed와 사용자 확장 레이어를 분리해 운영합니다. 공통 축은 `src/configs/entity_taxonomy.json`, 사용자별 확장은 `src/configs/entity_taxonomy.user.json`에 두는 방식입니다.
 
 ---
 
@@ -192,7 +209,7 @@ streamlit run apps/gui/app.py
 - [ ] **AI 기반 엔티티 정규화 고도화 (Advanced Entity Resolution)**
   - 현재의 taxonomy + semantic merge를 넘어, 임베딩 기반 군집화 + LLM 검증까지 포함한 고도화 파이프라인
 - [ ] **Seed Ontology 확장 워크플로우**
-  - taxonomy 미등록 엔티티를 후보로 수집하고, 임베딩/LLM 기반 상위 개념 추천 후 검토·승인 과정을 거쳐 ontology에 편입
+  - taxonomy 미등록 엔티티를 후보로 수집하고, 반복 출현 엔티티에 한해 임베딩/LLM 기반 상위 개념 추천 후 검토·승인 과정을 거쳐 ontology에 편입
 - [ ] **정교한 관계 속성 및 가중치 추출 (Rich Edge Attributes)**
   - 관계 감성(긍정/부정) 및 파급 강도(Weight)를 엣지 속성으로 반영
 - [ ] **동적 인사이트 요약 리포트 자동 생성 (Insight Generation)**

@@ -1,6 +1,9 @@
 import math
 import os
 import re
+import json
+import threading
+from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -9,7 +12,14 @@ from src.configs.schema import GraphData, Entity, Relation, ENTITY_TYPES, RELATI
 from src.configs.settings import (
     EMBEDDING_MODEL,
     ENABLE_ENTITY_SEMANTIC_MERGE,
+    ENABLE_TAXONOMY_ENRICHMENT,
+    ENABLE_ONTOLOGY_CANDIDATE_CAPTURE,
     ENTITY_SEMANTIC_MERGE_THRESHOLD,
+    ONTOLOGY_CANDIDATE_REGISTRY_PATH,
+    ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT,
+    ONTOLOGY_PARENT_SUGGESTION_THRESHOLD,
+    SEED_TAXONOMY_PATH,
+    USER_TAXONOMY_PATH,
 )
 
 class EntityResolver:
@@ -242,20 +252,25 @@ class EntityResolver:
         src/configs/entity_aliases.json 파일에서 동의어 맵핑 정보를 로드합니다.
         """
         self.alias_dict = alias_dict if alias_dict is not None else self._load_default_aliases()
+        self.enable_taxonomy_enrichment = ENABLE_TAXONOMY_ENRICHMENT
         self.taxonomy = self._load_taxonomy()
         self.alias_dict.update(self._build_taxonomy_aliases())
         self.enable_semantic_merge = ENABLE_ENTITY_SEMANTIC_MERGE and bool(os.getenv("GOOGLE_API_KEY"))
         self.semantic_merge_threshold = ENTITY_SEMANTIC_MERGE_THRESHOLD
+        self.enable_candidate_capture = ENABLE_ONTOLOGY_CANDIDATE_CAPTURE
+        self.candidate_registry_path = ONTOLOGY_CANDIDATE_REGISTRY_PATH
+        self.parent_suggestion_min_count = ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT
+        self.parent_suggestion_threshold = ONTOLOGY_PARENT_SUGGESTION_THRESHOLD
         self._embedder: Optional[GoogleGenerativeAIEmbeddings] = None
         self._canonical_names: List[str] = list(self.taxonomy.keys())
         self._canonical_embeddings: Optional[List[List[float]]] = None
         self._semantic_cache: Dict[str, str] = {}
         self._known_types = set(ENTITY_TYPES)
         self._known_relations = set(RELATION_TYPES)
+        self._lock = threading.Lock()
+        self._candidate_registry = self._load_candidate_registry()
 
     def _load_default_aliases(self) -> Dict[str, str]:
-        import json
-        
         # 파일 경로 설정 (src/configs/entity_aliases.json)
         base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
         config_path = os.path.join(base_dir, "configs", "entity_aliases.json")
@@ -271,21 +286,35 @@ class EntityResolver:
             print(f"⚠️ Alias 설정 파일({config_path})을 찾을 수 없습니다.")
             return {}
 
-    def _load_taxonomy(self) -> Dict[str, Dict]:
-        import json
-
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
-        config_path = os.path.join(base_dir, "configs", "entity_taxonomy.json")
-
-        if not os.path.exists(config_path):
+    def _load_taxonomy_file(self, config_path: str) -> Dict[str, Dict]:
+        if not config_path or not os.path.exists(config_path):
             return {}
 
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception as e:
-            print(f"⚠️ Taxonomy 설정을 불러오는데 실패했습니다: {e}")
+            print(f"⚠️ Taxonomy 설정을 불러오는데 실패했습니다 ({config_path}): {e}")
             return {}
+
+    def _merge_taxonomy_specs(self, seed: Dict[str, Dict], user: Dict[str, Dict]) -> Dict[str, Dict]:
+        merged = {name: dict(spec) for name, spec in seed.items()}
+        for canonical_name, spec in user.items():
+            existing = merged.get(canonical_name, {})
+            merged[canonical_name] = {
+                "type": spec.get("type", existing.get("type", "Entity")),
+                "aliases": spec.get("aliases", existing.get("aliases", [])),
+                "parents": spec.get("parents", existing.get("parents", [])),
+            }
+        return merged
+
+    def _load_taxonomy(self) -> Dict[str, Dict]:
+        if not self.enable_taxonomy_enrichment:
+            return {}
+
+        seed_taxonomy = self._load_taxonomy_file(SEED_TAXONOMY_PATH)
+        user_taxonomy = self._load_taxonomy_file(USER_TAXONOMY_PATH)
+        return self._merge_taxonomy_specs(seed_taxonomy, user_taxonomy)
 
     def _build_taxonomy_aliases(self) -> Dict[str, str]:
         alias_map: Dict[str, str] = {}
@@ -294,6 +323,28 @@ class EntityResolver:
             for alias in spec.get("aliases", []):
                 alias_map[alias] = canonical_name
         return alias_map
+
+    def _load_candidate_registry(self) -> Dict[str, Dict]:
+        if not self.enable_candidate_capture:
+            return {}
+        if not os.path.exists(self.candidate_registry_path):
+            return {}
+        try:
+            with open(self.candidate_registry_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"⚠️ Ontology 후보 레지스트리를 불러오는데 실패했습니다: {e}")
+            return {}
+
+    def _persist_candidate_registry(self) -> None:
+        if not self.enable_candidate_capture:
+            return
+        try:
+            os.makedirs(os.path.dirname(self.candidate_registry_path), exist_ok=True)
+            with open(self.candidate_registry_path, "w", encoding="utf-8") as f:
+                json.dump(self._candidate_registry, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print(f"⚠️ Ontology 후보 레지스트리 저장 실패: {e}")
 
     def _get_embedder(self) -> Optional[GoogleGenerativeAIEmbeddings]:
         if not self.enable_semantic_merge:
@@ -427,8 +478,9 @@ class EntityResolver:
     def _semantic_match(self, name: str, declared_type: Optional[str]) -> Optional[str]:
         if not self.enable_semantic_merge or not name:
             return None
-        if name in self._semantic_cache:
-            return self._semantic_cache[name]
+        with self._lock:
+            if name in self._semantic_cache:
+                return self._semantic_cache[name]
 
         self._ensure_canonical_embeddings()
         embedder = self._get_embedder()
@@ -455,9 +507,92 @@ class EntityResolver:
                 best_match = canonical_name
 
         if best_match and best_score >= self.semantic_merge_threshold:
-            self._semantic_cache[name] = best_match
+            with self._lock:
+                self._semantic_cache[name] = best_match
             return best_match
         return None
+
+    def _suggest_parent_relation(self, entity_type: str, parent_type: str) -> str:
+        if entity_type == parent_type:
+            return "PART_OF"
+        if entity_type == "Product" and parent_type == "Industry":
+            return "BELONGS_TO"
+        if entity_type == "RiskFactor" and parent_type == "MacroEvent":
+            return "BELONGS_TO"
+        return "PART_OF"
+
+    def _suggest_parent_candidates(self, name: str, entity_type: str) -> List[Dict]:
+        if not self.enable_semantic_merge or not name:
+            return []
+
+        self._ensure_canonical_embeddings()
+        embedder = self._get_embedder()
+        if embedder is None or not self._canonical_embeddings:
+            return []
+
+        try:
+            query_embedding = embedder.embed_query(name)
+        except Exception as e:
+            print(f"⚠️ Parent 후보 임베딩 생성 실패 ({name}): {e}")
+            return []
+
+        ranked: List[Tuple[str, str, float]] = []
+        for canonical_name, canonical_embedding in zip(self._canonical_names, self._canonical_embeddings):
+            if canonical_name == name:
+                continue
+            canonical_type = self.taxonomy.get(canonical_name, {}).get("type", "Entity")
+            if canonical_type not in (entity_type, "Entity", "Industry", "MacroEvent"):
+                continue
+            score = self._cosine_similarity(query_embedding, canonical_embedding)
+            if score >= self.parent_suggestion_threshold:
+                ranked.append((canonical_name, canonical_type, score))
+
+        ranked.sort(key=lambda item: item[2], reverse=True)
+        suggestions: List[Dict] = []
+        for canonical_name, canonical_type, score in ranked[:3]:
+            suggestions.append({
+                "name": canonical_name,
+                "type": canonical_type,
+                "relation": self._suggest_parent_relation(entity_type, canonical_type),
+                "score": round(score, 4),
+            })
+        return suggestions
+
+    def _register_candidate(self, name: str, entity_type: str, source_kind: str) -> None:
+        if not self.enable_candidate_capture or not name or name in self.taxonomy:
+            return
+
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            record = self._candidate_registry.get(name, {
+                "name": name,
+                "entity_type": entity_type,
+                "mention_count": 0,
+                "status": "suggested",
+                "observed_types": {},
+                "sources": [],
+                "suggested_parents": [],
+                "first_seen_at": now,
+                "last_seen_at": now,
+            })
+            record["mention_count"] += 1
+            record["last_seen_at"] = now
+            record["entity_type"] = self._prefer_type(record.get("entity_type", "Entity"), entity_type)
+            observed_types = record.setdefault("observed_types", {})
+            observed_types[entity_type] = observed_types.get(entity_type, 0) + 1
+            if source_kind not in record.setdefault("sources", []):
+                record["sources"].append(source_kind)
+
+            if (
+                record["mention_count"] >= self.parent_suggestion_min_count
+                and not record.get("suggested_parents")
+            ):
+                record["suggested_parents"] = self._suggest_parent_candidates(
+                    name,
+                    record["entity_type"],
+                )
+
+            self._candidate_registry[name] = record
 
     def _resolve_name(self, name: Optional[str], declared_type: Optional[str] = None) -> str:
         clean_name = self._clean_name(name)
@@ -533,6 +668,7 @@ class EntityResolver:
                 entity_map[normalized_name].type = self._prefer_type(entity_map[normalized_name].type, normalized_type)
             else:
                 entity_map[normalized_name] = Entity(name=normalized_name, type=normalized_type)
+            self._register_candidate(normalized_name, normalized_type, "entity_extraction")
             name_cache[entity.name] = normalized_name
             
         # 2. 관계 정규화 (엣지의 출발점/도착점 이름도 표준화된 이름에 맞춰 변경)
@@ -549,11 +685,13 @@ class EntityResolver:
                     name=normalized_source,
                     type=self._infer_type(normalized_source, None),
                 )
+            self._register_candidate(normalized_source, entity_map[normalized_source].type, "relation_endpoint")
             if normalized_target not in entity_map:
                 entity_map[normalized_target] = Entity(
                     name=normalized_target,
                     type=self._infer_type(normalized_target, None),
                 )
+            self._register_candidate(normalized_target, entity_map[normalized_target].type, "relation_endpoint")
 
             relation_key = (
                 normalized_source,
@@ -589,5 +727,7 @@ class EntityResolver:
             if relation_key not in relation_keys:
                 relation_keys.add(relation_key)
                 resolved_relations.append(rel)
+
+        self._persist_candidate_registry()
 
         return GraphData(entities=list(entity_map.values()), relations=resolved_relations)

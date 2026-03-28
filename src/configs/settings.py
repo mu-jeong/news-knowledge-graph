@@ -6,6 +6,8 @@ settings.py — 프로젝트 전역 튜닝 파라미터 관리
 """
 import os
 
+BASE_DIR: str = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
+
 # ──────────────────────────────────────────
 # LLM 설정
 # ──────────────────────────────────────────
@@ -87,6 +89,38 @@ ENABLE_ENTITY_SEMANTIC_MERGE: bool = os.getenv("ENABLE_ENTITY_SEMANTIC_MERGE", "
 
 # 엔티티 의미 기반 병합 임계값
 ENTITY_SEMANTIC_MERGE_THRESHOLD: float = float(os.getenv("ENTITY_SEMANTIC_MERGE_THRESHOLD", "0.9"))
+
+# taxonomy 확장 사용 여부
+ENABLE_TAXONOMY_ENRICHMENT: bool = os.getenv("ENABLE_TAXONOMY_ENRICHMENT", "1") == "1"
+
+# 공통 seed taxonomy 경로
+SEED_TAXONOMY_PATH: str = os.getenv(
+    "SEED_TAXONOMY_PATH",
+    os.path.join(BASE_DIR, "src", "configs", "entity_taxonomy.json"),
+)
+
+# 사용자 확장 taxonomy 경로
+USER_TAXONOMY_PATH: str = os.getenv(
+    "USER_TAXONOMY_PATH",
+    os.path.join(BASE_DIR, "src", "configs", "entity_taxonomy.user.json"),
+)
+
+# ontology 후보 수집 사용 여부
+ENABLE_ONTOLOGY_CANDIDATE_CAPTURE: bool = os.getenv("ENABLE_ONTOLOGY_CANDIDATE_CAPTURE", "1") == "1"
+
+# taxonomy 미등록 엔티티 후보 레지스트리 경로
+ONTOLOGY_CANDIDATE_REGISTRY_PATH: str = os.getenv(
+    "ONTOLOGY_CANDIDATE_REGISTRY_PATH",
+    os.path.join(BASE_DIR, "data", "ontology_candidates.json"),
+)
+
+# 반복 출현 엔티티에 대해서만 parent 후보를 추천
+ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT: int = int(os.getenv("ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT", "3"))
+
+# parent 후보 추천 시 최소 유사도
+ONTOLOGY_PARENT_SUGGESTION_THRESHOLD: float = float(
+    os.getenv("ONTOLOGY_PARENT_SUGGESTION_THRESHOLD", "0.78")
+)
 
 
 # ──────────────────────────────────────────
