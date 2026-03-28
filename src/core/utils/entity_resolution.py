@@ -31,7 +31,12 @@ class EntityResolver:
         "VULNERABLE_TO": "EXPOSED_TO",
         "AFFECTED_BY": "EXPOSED_TO",
         "IMPACTED_BY": "EXPOSED_TO",
+        "EXPOSED": "EXPOSED_TO",
+        "EXPOSED_TO_RISK": "EXPOSED_TO",
         "IMPACTS": "AFFECTS",
+        "AFFECT": "AFFECTS",
+        "INFLUENCES": "AFFECTS",
+        "DRIVES": "AFFECTS",
         "USED_IN": "USES",
         "USED_BY": "USES",
         "POWERED_BY": "USES",
@@ -39,14 +44,20 @@ class EntityResolver:
         "USES_TECH": "USES",
         "BELONGS_IN": "BELONGS_TO",
         "BELONG_TO": "BELONGS_TO",
+        "BELONGS_WITHIN": "BELONGS_TO",
         "IS_A": "PART_OF",
         "KIND_OF": "PART_OF",
         "CATEGORY_OF": "PART_OF",
         "SUBCATEGORY_OF": "PART_OF",
         "PARTOF": "PART_OF",
+        "WITHIN": "PART_OF",
         "RELEASES": "RELEASED",
         "BENEFITS": "BENEFITS_FROM",
         "BENEFITED_FROM": "BENEFITS_FROM",
+        "SUPPORTED_BY": "BENEFITS_FROM",
+        "RELATES_TO": "RELATED_TO",
+        "ASSOCIATED_WITH": "RELATED_TO",
+        "CONNECTED_TO": "RELATED_TO",
     }
 
     GENERIC_ENTITY_EXACT = {
@@ -121,6 +132,43 @@ class EntityResolver:
         "센터",
         "기관",
     )
+
+    ABSTRACT_ENTITY_SUFFIXES = (
+        "기대감",
+        "전망",
+        "가능성",
+        "모멘텀",
+        "효과",
+        "영향",
+        "부담",
+        "대책",
+        "기조",
+        "강화",
+        "확대",
+        "감소",
+        "증가",
+        "하락",
+        "상승",
+        "수요",
+        "공급",
+        "전환",
+        "회복",
+    )
+
+    ENGLISH_DESCRIPTIVE_TOKENS = {
+        "reduced",
+        "increase",
+        "decrease",
+        "demand",
+        "supply",
+        "growth",
+        "decline",
+        "expansion",
+        "expectation",
+        "pressure",
+        "outlook",
+        "recovery",
+    }
 
     TYPE_KEYWORDS = {
         "Technology": (
@@ -278,6 +326,26 @@ class EntityResolver:
     def _tokenize_name(self, name: str) -> List[str]:
         return [token for token in re.split(r"[\s/·(),\-]+", name) if token]
 
+    def _is_english_descriptive_phrase(self, name: str) -> bool:
+        if re.search(r"[가-힣]", name):
+            return False
+        tokens = self._tokenize_name(name.lower())
+        if len(tokens) < 2:
+            return False
+        if any(token in self.ENGLISH_DESCRIPTIVE_TOKENS for token in tokens):
+            return True
+        return all(token.isalpha() and token.islower() for token in tokens)
+
+    def _is_descriptive_abstract_entity(self, name: str, declared_type: Optional[str]) -> bool:
+        if declared_type in {"RiskFactor", "MacroEvent"}:
+            return False
+        tokens = self._tokenize_name(name)
+        if len(tokens) < 2:
+            return False
+        if tokens[-1] in self.ABSTRACT_ENTITY_SUFFIXES:
+            return True
+        return False
+
     def _is_generic_category_entity(self, name: str) -> bool:
         if not name or name in self.taxonomy:
             return False
@@ -300,13 +368,17 @@ class EntityResolver:
 
         return False
 
-    def _is_low_quality_entity(self, name: str) -> bool:
+    def _is_low_quality_entity(self, name: str, declared_type: Optional[str] = None) -> bool:
         if not name or len(name) < 2:
             return True
         low_signal_suffixes = ("입니다", "했다", "하는", "하며", "관련", "대한", "위한")
         if name.endswith(low_signal_suffixes):
             return True
         if name.count(" ") >= 5:
+            return True
+        if self._is_english_descriptive_phrase(name):
+            return True
+        if self._is_descriptive_abstract_entity(name, declared_type):
             return True
         if self._is_generic_category_entity(name):
             return True
@@ -454,7 +526,7 @@ class EntityResolver:
         # 1. 엔티티 정규화 (노드 이름 표준화)
         for entity in graph_data.entities:
             normalized_name = self._resolve_name(entity.name, entity.type)
-            if self._is_low_quality_entity(normalized_name):
+            if self._is_low_quality_entity(normalized_name, entity.type):
                 continue
             normalized_type = self._infer_type(normalized_name, entity.type)
             if normalized_name in entity_map:

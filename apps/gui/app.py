@@ -235,7 +235,10 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                 MATCH (n:Entity)-[r]->(m:Entity)
                 WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
                 WHERE coalesce(rel_props['source_url'], '') IN article_ids 
-                   OR coalesce(rel_props['source_article'], '') IN article_titles
+                   OR (
+                        coalesce(rel_props['source_url'], '') = ''
+                        AND coalesce(rel_props['source_article'], '') IN article_titles
+                   )
                    OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 
                 RETURN n.id AS source, 
@@ -271,7 +274,10 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                 MATCH (n:Entity)-[r]-(m:Entity)
                 WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
                 WHERE coalesce(rel_props['source_url'], '') IN article_ids 
-                   OR coalesce(rel_props['source_article'], '') IN article_titles
+                   OR (
+                        coalesce(rel_props['source_url'], '') = ''
+                        AND coalesce(rel_props['source_article'], '') IN article_titles
+                   )
                    OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 RETURN n.id AS node_id, count(r) AS degree
             """, **params)}
