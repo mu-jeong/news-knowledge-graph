@@ -1,9 +1,8 @@
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.graphs import Neo4jGraph
 from neo4j import GraphDatabase
 import os
 import json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 
 from src.graphs.state import AgentState
 from src.configs.settings import (
@@ -17,9 +16,9 @@ def get_neo4j_driver():
     except:
         return None
 
-def _prepare_search_context(batch_results: List[Dict[str, Any]]) -> tuple[str, dict]:
+def _prepare_search_context(article_results: List[Dict[str, Any]]) -> tuple[str, dict]:
     """
-    여러 배치의 (텍스트, URL 리스트) 정보를 하나로 합치고, 
+    여러 기사 검색 결과의 (텍스트, URL 리스트) 정보를 하나로 합치고,
     기사 ID([Article_N])를 전역적으로 고유하게 재부여하면서 매핑 테이블을 생성합니다.
     """
     import re
@@ -27,9 +26,9 @@ def _prepare_search_context(batch_results: List[Dict[str, Any]]) -> tuple[str, d
     source_links = {}
     global_article_idx = 1
     
-    for batch in batch_results:
-        batch_text = batch.get("text", "")
-        batch_urls = batch.get("urls", []) # DB에서 가져온 URL 목록
+    for article in article_results:
+        batch_text = article.get("text", "")
+        batch_urls = article.get("urls", []) # DB에서 가져온 URL 목록
         
         if not batch_text: continue
         
@@ -67,19 +66,17 @@ def vector_retriever_node(state: AgentState) -> dict:
         embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=os.getenv("GOOGLE_API_KEY"))
         query_vector = embedder.embed_query(question)
         
-        # Neo4j Vector Index 검색 + 연결된 NewsArticle URL 가져오기
+        # Neo4j Vector Index 검색 (기사 단위)
         with driver.session() as session:
             result = session.run("""
-                CALL db.index.vector.queryNodes('batch_embedding', 3, $query_vector)
+                CALL db.index.vector.queryNodes('article_embedding', 10, $query_vector)
                 YIELD node, score
-                MATCH (node)-[:HAS_SOURCE]->(a:NewsArticle)
-                WITH node, score, a
-                ORDER BY a.published_at DESC
-                RETURN node.text AS text, collect(a.url) AS urls, score
+                RETURN node.text AS text, [node.id] AS urls, score
+                ORDER BY score DESC
             """, query_vector=query_vector)
             
-            batch_results = [record.data() for record in result]
-            search_context, source_links = _prepare_search_context(batch_results)
+            article_results = [record.data() for record in result]
+            search_context, source_links = _prepare_search_context(article_results)
             return {"search_context": search_context, "source_links": source_links, "cypher_result": []}
     except Exception as e:
         print(f"Vector Retrieval Error: {e}")
@@ -117,15 +114,26 @@ def text2cypher_retriever_node(state: AgentState) -> dict:
         
         with driver.session() as session:
             result = session.run(cypher_query)
-            # data()를 사용하면 Node/Relationship 객체가 dict로 자동 변환되어 JSON 직렬화가 가능해집니다.
+            # data()를 사용하면 Node/Relationship 객체가 dict로 자동 변환됩니다.
             data = [record.data() for record in result]
             
-        return {"generated_cypher": cypher_query, "cypher_result": data, "search_context": json.dumps(data, ensure_ascii=False)[:2000]}
+        # JSON 직렬화 불가 객체(DateTime 등) 처리
+        def _json_serializable(obj):
+            try:
+                # datetime, date 등 isoformat() 지원 시 호출
+                if hasattr(obj, 'isoformat'):
+                    return obj.isoformat()
+            except:
+                pass
+            return str(obj)
+
+        search_context = json.dumps(data, ensure_ascii=False, default=_json_serializable)[:2000]
+        return {"generated_cypher": cypher_query, "cypher_result": data, "search_context": search_context}
     except Exception as e:
         return {"cypher_result": [], "search_context": f"Cypher 에러: {e}"}
 
 def vector_cypher_retriever_node(state: AgentState) -> dict:
-    # Entities to NewsBatches (Hybrid)
+    # Entities to NewsArticles (Hybrid)
     entities = state.get("extracted_entities", [])
     question = state.get("question", "")
     driver = get_neo4j_driver()
@@ -140,34 +148,32 @@ def vector_cypher_retriever_node(state: AgentState) -> dict:
         with driver.session() as session:
             # entities가 1개일 때와 2개 이상일 때를 커버
             if len(entities) >= 2:
-                # 2개 이상이면 교집합을 갖는 배치를 우선 검색
+                # 2개 이상이면 교집합을 갖는 기사를 우선 검색
                 cypher = """
-                MATCH (c:NewsBatch)-[:MENTIONS]->(e1:Entity) WHERE e1.name CONTAINS $e1
-                MATCH (c)-[:MENTIONS]->(e2:Entity) WHERE e2.name CONTAINS $e2
-                MATCH (c)-[:HAS_SOURCE]->(a:NewsArticle)
-                WITH c, a
+                MATCH (a:NewsArticle)-[:MENTIONS]->(e1:Entity) WHERE e1.name CONTAINS $e1
+                MATCH (a)-[:MENTIONS]->(e2:Entity) WHERE e2.name CONTAINS $e2
+                WITH a
                 ORDER BY a.published_at DESC
-                RETURN c.text AS text, collect(a.url) AS urls LIMIT 3
+                RETURN a.text AS text, [a.id] AS urls LIMIT 5
                 """
                 params = {"e1": entities[0], "e2": entities[1]}
             else:
                 cypher = """
-                MATCH (c:NewsBatch)-[:MENTIONS]->(e:Entity) WHERE e.name CONTAINS $e1
-                MATCH (c)-[:HAS_SOURCE]->(a:NewsArticle)
-                WITH c, a
+                MATCH (a:NewsArticle)-[:MENTIONS]->(e:Entity) WHERE e.name CONTAINS $e1
+                WITH a
                 ORDER BY a.published_at DESC
-                RETURN c.text AS text, collect(a.url) AS urls LIMIT 3
+                RETURN a.text AS text, [a.id] AS urls LIMIT 5
                 """
                 params = {"e1": entities[0]}
                 
             result = session.run(cypher, **params)
-            batch_results = [record.data() for record in result]
-            
-            if not batch_results:
+            article_results = [record.data() for record in result]
+
+            if not article_results:
                 # 관계망에 텍스트가 안 보이면 순수 Vector로 Fallback
                 return vector_retriever_node(state)
             
-            search_context, source_links = _prepare_search_context(batch_results)
+            search_context, source_links = _prepare_search_context(article_results)
             return {"search_context": search_context, "source_links": source_links}
     except Exception as e:
         return {"search_context": f"Hybrid 검색 에러: {e}", "source_links": {}}

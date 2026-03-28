@@ -1,7 +1,5 @@
 import os
-from datetime import datetime
 from typing import Optional, List, Dict, Any
-import uuid
 from neo4j import GraphDatabase
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from src.configs.schema import GraphData
@@ -30,22 +28,22 @@ class Neo4jLoader:
             self.driver.close()
 
     def create_vector_index(self):
-        """NewsBatch 노드의 embedding 속성에 대한 Neo4j Vector Index 생성 (Gemini v4: 3072차원)"""
+        """NewsArticle 노드의 embedding 속성에 대한 Neo4j Vector Index 생성 (Gemini v4: 3072차원)"""
         if not self.driver: return
         try:
             with self.driver.session() as session:
-                # 기존 인덱스가 차원수가 다를 수 있으므로 삭제 후 재생성 (선택 사항)
-                session.run("DROP INDEX batch_embedding IF EXISTS")
-                
+                # 기존 인덱스 삭제 후 재생성
+                session.run("DROP INDEX article_embedding IF EXISTS")
+                session.run("DROP INDEX batch_embedding IF EXISTS") # 과거 구형 인덱스 청소
                 session.run(f"""
-                CREATE VECTOR INDEX batch_embedding IF NOT EXISTS
-                FOR (c:NewsBatch) ON (c.embedding)
+                CREATE VECTOR INDEX article_embedding IF NOT EXISTS
+                FOR (a:NewsArticle) ON (a.embedding)
                 OPTIONS {{indexConfig: {{
                   `vector.dimensions`: {VECTOR_INDEX_DIM},
                   `vector.similarity_function`: 'cosine'
                 }}}}
                 """)
-                print("🧠 NewsBatch Vector Index 확인 완료!")
+                print("🧠 NewsArticle Vector Index 확인 완료!")
         except Exception as e:
             print(f"⚠️ Vector 인덱스 생성 오류: {e}")
 
@@ -138,42 +136,42 @@ class Neo4jLoader:
     def load_graph_data(self, graph_data: GraphData, batch_text: Optional[str] = None):
         """
         [지능형 데이터 적재]
-        기존의 NewsArticle 노드(크롤러)와 추출된 엔티티를 통합하고, 
-        원본 batch_text를 벡터 임베딩하여 NewsBatch 노드로 저장합니다.
+        기존의 NewsArticle 노드(크롤러)와 추출된 엔티티를 직접 연결하고, 
+        기사별 텍스트를 벡터 임베딩하여 NewsArticle 노드에 저장합니다.
         """
         if not self.driver: return
         
-        batch_id = str(uuid.uuid4())
-        embedding = None
-        if batch_text:
-            try:
-                google_api_key = os.getenv("GOOGLE_API_KEY")
-                embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=google_api_key)
-                embedding = embedder.embed_query(batch_text)
-            except Exception as e:
-                print(f"⚠️ 임베딩 생성 실패: {e}")
+        import re
+        google_api_key = os.getenv("GOOGLE_API_KEY")
+        embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=google_api_key)
 
         with self.driver.session() as session:
-            # 0. 거미줄 폭발 억제 및 본문 보존을 위한 NewsBatch 노드 생성
-            if batch_text and embedding:
-                import re
-                batch_urls = re.findall(r'링크:\s*([^\s]+)', batch_text)
-
-                session.run(
-                    "MERGE (c:NewsBatch {id: $batch_id}) SET c.text = $text, c.embedding = $embedding",
-                    batch_id=batch_id, text=batch_text, embedding=embedding
-                )
-                
-                # NewsBatch와 NewsArticle 간의 명시적 구조화 엣지 생성
-                for url in batch_urls:
-                    session.run(
-                        """
-                        MATCH (c:NewsBatch {id: $batch_id})
-                        MERGE (a:NewsArticle {id: $url})
-                        MERGE (c)-[:HAS_SOURCE]->(a)
-                        """,
-                        batch_id=batch_id, url=url
-                    )
+            # 0. 기사별 임베딩 생성 및 저장
+            if batch_text:
+                # '---' 구분자로 개별 기사 분리
+                article_blocks = batch_text.split("\n---\n")
+                for block in article_blocks:
+                    block = block.strip()
+                    if not block: continue
+                    
+                    # URL 추출
+                    url_match = re.search(r'링크:\s*([^\s]+)', block)
+                    if url_match:
+                        url = url_match.group(1)
+                        try:
+                            # 개별 기사 임베딩 생성
+                            article_embedding = embedder.embed_query(block)
+                            
+                            # NewsArticle 노드에 텍스트와 임베딩 저장
+                            session.run(
+                                """
+                                MERGE (a:NewsArticle {id: $url})
+                                SET a.text = $text, a.embedding = $embedding
+                                """,
+                                url=url, text=block, embedding=article_embedding
+                            )
+                        except Exception as e:
+                            print(f"⚠️ 기사 임베딩 생성 실패 ({url}): {e}")
 
             # 1. 노드 적재
             for entity in graph_data.entities:
@@ -181,9 +179,7 @@ class Neo4jLoader:
                 label = entity.type.replace(" ", "_").strip()
                 if not label: label = "Entity"
 
-                props = {
-                    "id": name, "name": name
-                }
+                props = {"id": name, "name": name}
 
                 query = f"""
                 MERGE (n:Entity {{id: $id}}) 
@@ -192,33 +188,33 @@ class Neo4jLoader:
                 """
                 session.run(query, **props)
                 
-                # NewsBatch와 Entity의 연결 (동시 출현 명시)
-                if batch_text and embedding:
-                    session.run(
-                        "MATCH (c:NewsBatch {id: $batch_id}), (n:Entity {name: $name}) MERGE (c)-[:MENTIONS]->(n)",
-                        batch_id=batch_id, name=props["name"]
-                    )
+                # NewsArticle와 Entity의 직접 연결 (어떤 기사에서 언급되었는지 명시)
+                if batch_text:
+                    # 해당 엔티티가 언급된 기사들의 URL을 찾음 (batch_text 전체 기준)
+                    # 실제로는 LLM 결과의 source_url을 사용하는 것이 더 정확함 (2단계에서 처리)
+                    pass
 
             # 2. 관계 적재 (핵심: 다각도 매칭으로 사일로 제거)
             for rel in graph_data.relations:
                 edge_type = rel.type.replace(" ", "_").strip().upper()
                 if not edge_type: edge_type = "RELATED_TO"
 
+                # 엔티티 간의 관계 생성 및 원본 기사 직결
                 rel_query = f"""
-                MATCH (s:Entity) 
-                WHERE s.id = $s_name OR s.name = $s_name
-                
-                MATCH (t:Entity) 
-                WHERE t.id = $t_name OR t.name = $t_name
+                MATCH (s:Entity) WHERE s.id = $s_name OR s.name = $s_name
+                MATCH (t:Entity) WHERE t.id = $t_name OR t.name = $t_name
+                MATCH (a:NewsArticle {{id: $s_url}})
                 
                 MERGE (s)-[r:{edge_type}]->(t)
                 SET r.description = $desc, 
                     r.source_url = $s_url, 
-                    r.source_article = $s_art,
-                    r.source_batch_id = $batch_id
+                    r.source_article = $s_art
+                
+                // 기사와 엔티티 간의 MENTIONS 관계도 동시에 생성
+                MERGE (a)-[:MENTIONS]->(s)
+                MERGE (a)-[:MENTIONS]->(t)
                 """
                 session.run(rel_query, 
                     s_name=rel.source.strip(), t_name=rel.target.strip(),
-                    desc=rel.description, s_url=rel.source_url, s_art=rel.source_article,
-                    batch_id=batch_id if batch_text else None
+                    desc=rel.description, s_url=rel.source_url, s_art=rel.source_article
                 )

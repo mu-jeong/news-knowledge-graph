@@ -27,11 +27,11 @@
 1. **Data Ingestion (크롤링):** 신뢰 언론사(화이트리스트) 기사만 선별 수집합니다. 수집 기간은 달력 일(日) 기준으로, 1일이면 '오늘', 5일이면 '오늘 포함 과거 5일'입니다. (최대 100일)
 2. **Watermark 기반 증분 처리:** 각 키워드별로 날짜별 마지막 수집 시각(Watermark)을 Neo4j에 저장합니다. 재검색 시 이미 수집 완료된 날짜는 건너뛰고, 부분 수집된 날짜(당일 등)는 해당 시각 이후 기사만 신규 수집합니다.
 3. **Deduplication & Filtering:** TF-IDF + 코사인 유사도 기반으로 날짜별 유사 기사를 제거하고, 하루 최대 기사 수를 초과 시 균등 샘플링합니다.
-4. **Article-level Batch 처리:** 기사 10개 단위로 배치를 구성하며, 각 기사에 `[Article_1]` ~ `[Article_N]` 형태의 고유 ID를 부여하여 LLM이 출처 추적이 가능한 구조화된 추출을 수행합니다.
+4. **Article-level Embedding:** 각 기사를 독립적인 단위로 벡터 임베딩하여 `NewsArticle` 노드에 저장합니다. 이를 통해 기사 단위의 정밀한 벡터 검색이 가능합니다.
 5. **Entity Resolution (정규화):** 추출된 엔티티의 동의어를 `entity_aliases.json` 매핑 규칙으로 표준어로 병합합니다.
-6. **Graph Construction (증분 적재):** 정제된 엔티티와 관계 데이터를 Neo4j에 **MERGE 방식으로 누적 적재**합니다. 실제로 수집된 기사의 날짜만 워터마크로 기록합니다.
+6. **Graph Construction (증분 적재):** 정제된 엔티티와 관계 데이터를 Neo4j에 **MERGE 방식으로 누적 적재**합니다. 기사와 엔티티를 `[:MENTIONS]` 관계로 직접 연결합니다.
 7. **Visualization & Analytics (시각화 및 분석):** 날짜 필터를 그래프 데이터베이스 쿼리에 직접 반영하여, 선택한 기간 내 기사에서 추출된 관계만 그래프로 시각화합니다.
-8. **Graph RAG 챗봇:** 자연어 질문을 받아 Vector / Text-to-Cypher / Hybrid 방식으로 지식 그래프를 검색합니다. 검색된 `NewsBatch` 노드와 연결된 `NewsArticle` 노드에서 URL을 직접 추출하여 **[참조 링크 매핑 테이블]**을 생성하고, 전역적 기사 번호를 동적 재부여(Dynamic Re-indexing)하여 100% 정확한 출처 정보를 제공합니다.
+8. **Graph RAG 챗봇:** 자연어 질문을 받아 Vector / Text-to-Cypher / Hybrid 방식으로 지식 그래프를 검색합니다. 검색된 `NewsArticle` 노드에서 URL을 직접 추출하여 **[참조 링크 매핑 테이블]**을 생성하고 100% 정확한 출처 정보를 제공합니다.
 
 ---
 
@@ -71,16 +71,16 @@
   * `get_keyword_watermarks(keyword)`: 키워드별 날짜별 마지막 수집 시각(Watermark)을 JSON 문자열로 반환합니다. 증분 처리의 기준점으로 사용됩니다.
   * `update_keyword_watermarks(keyword, watermarks)`: 수집이 완료된 기사의 실제 발행일을 기준으로 날짜별 워터마크를 갱신합니다. **실제로 기사를 수집한 날짜만** 업데이트하여 미래 재검색 시 누락이 발생하지 않도록 합니다.
   * `upsert_articles(keyword, articles)`: 기사를 `NewsArticle` 노드로 저장하고 `Keyword` 노드와 연결합니다.
-  * `load_graph_data(graph_data, batch_text)`: LLM 추출 엔티티/관계를 MERGE 방식으로 적재하고 `NewsBatch` 노드를 생성하여 원본 기사(`NewsArticle`)와 `[:HAS_SOURCE]` 관계로 연결합니다.
-  * `create_vector_index()`: `NewsBatch` 노드의 임베딩을 저장하는 벡터 인덱스(`batch_embedding`, 3072차원)를 생성합니다.
+  * `load_graph_data(graph_data, batch_text)`: 기별 텍스트를 개별적으로 임베딩하여 `NewsArticle`에 저장하고, 추출된 엔티티와 관계를 `[:MENTIONS]` 등으로 직접 연결합니다.
+  * `create_vector_index()`: `NewsArticle` 노드의 임베딩을 저장하는 벡터 인덱스(`article_embedding`, 3072차원)를 생성합니다.
 * **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), 재시도 횟수(`retry_count`), 검증 실패 시 에러 메시지(`final_answer`), 그리고 **기사 ID와 URL 매핑 테이블(`source_links`)**을 관리합니다.
 * **`hybrid_rag.py`:** `router`를 필두로 Vector / Text-to-Cypher / Hybrid(Entity-based) 3가지 검색 경로를 가진 LangGraph 기반 RAG 에이전트입니다. `MemorySaver`를 통해 대화 기록을 보존하며, **text2cypher 경로에는 `cypher_validator` 노드를 반드시 거쳐 Cypher Injection 및 문법 오류를 차단합니다.**
 
 ### `src/nodes/` (Layer 4-1: RAG Retriever & Generator)
 
 * **`router.py`:** 사용자의 자연어 질문을 분석하여 어떤 검색 경로(`vector`, `text2cypher`, `vector_cypher`)를 사용할지 결정하는 분류기(Classifier) 노드입니다.
-* **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다. 모든 리트리버는 검색된 텍스트 배치(`NewsBatch`)와 관계된 기사(`NewsArticle`)의 URL을 Neo4j에서 직접 가져와 `_prepare_search_context`를 통해 전역적으로 고유한 번호를 매기고 매핑 테이블을 생성합니다.
-  * `vector_retriever_node`: `batch_embedding` 벡터 인덱스 검색 시 `[:HAS_SOURCE]` 관계를 JOIN하여 URL을 함께 리턴합니다.
+* **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다. 모든 리트리버는 검색된 기사(`NewsArticle`)의 본문 텍스트와 URL을 Neo4j에서 직접 가져와 `_prepare_search_context`를 통해 전역적으로 고유한 번호를 매기고 매핑 테이블을 생성합니다.
+  * `vector_retriever_node`: `article_embedding` 벡터 인덱스를 사용해 기사 단위로 검색하고, `NewsArticle`의 URL을 함께 리턴합니다.
   * `text2cypher_retriever_node`: LLM이 자연어 → Cypher 변환 후 Neo4j 직접 쿼리. 관계형 추론이 필요한 질문에 유리합니다. → 반드시 `cypher_validator`를 거칩니다.
   * `vector_cypher_retriever_node`: 엔티티 기반 Hybrid 검색. 특정 엔티티를 포함하는 배치와 기사 URL을 최우선으로 리턴합니다.
 * **`cypher_validator.py`:** (필수 보안 노드) `text2cypher_retriever`가 생성한 Cypher 쿼리를 실행 전에 2단계로 검증합니다.
@@ -130,15 +130,11 @@
 ```
 (:Keyword {name, last_updated})
     │
-    └──[:HAS_ARTICLE]──▶ (:NewsArticle {id=url, url, title, published_at, keyword})
-                                ▲
-                                │ [:HAS_SOURCE]
-                         (:NewsBatch {id, text, embedding})
+    └──[:HAS_ARTICLE]──▶ (:NewsArticle {id=url, url, title, published_at, keyword, text, embedding})
                                 │
-                                 └──[:MENTIONS]──▶ (:Entity / :Company / :Industry / :MacroEvent / :Product)
+                                └──[:MENTIONS]──▶ (:Entity / :Company / :Industry / :MacroEvent / :Product)
                                                         │
-                                              [:RELATION_TYPE {description, source_article, source_url, source_batch_id}]
-                                                        │
+                                              [:RELATION_TYPE {description, source_article, source_url}]
                                                         ▼
                                                    (:Entity)
 ```
@@ -146,8 +142,7 @@
 | 노드 | 속성 | 역할 |
 |------|------|------|
 | `Keyword` | `name`, `last_updated`, `watermarks` | 검색어 추적, 날짜별 마지막 수집 시각(Watermark) 기록 |
-| `NewsArticle` | `id`(PK=url), `url`, `title`, `published_at`, `keyword` | 기사 중복 방지 + 증분 기준점 |
-| `NewsBatch` | `id`, `text`, `embedding` | LLM 입력 텍스트 배치 (10개 기사). 벡터 검색의 단위. |
+| `NewsArticle` | `id`(PK=url), `url`, `title`, `published_at`, `keyword`, `text`, `embedding` | 기사 중복 방지 + 증분 기준점 + 벡터 검색의 단위 |
 | `Entity` 계열 | `id`(PK=name), `name` | `Company`, `Industry`, `MacroEvent`, `Product` 타입 포함. 키워드 무관 공유 → 크로스-키워드 분석 |
 
 ---

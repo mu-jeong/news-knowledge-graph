@@ -144,7 +144,7 @@ def run_pipeline(keyword: str, days_back: int = 7):
         if loader.driver:
             # 3-0. 벡터 인덱스 먼저 생성
             loader.create_vector_index()
-            # 3-1. 엔티티/관계 및 NewsBatch MERGE 적재
+            # 3-1. 엔티티/관계 및 기사 본문 임베딩 누적 적재
             for g, batch_text in all_resolved:
                 loader.load_graph_data(g, batch_text=batch_text)
             # 3-2. Article 노드 저장 + Keyword 노드 갱신
@@ -513,7 +513,6 @@ net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
 # 노드 색상 맵 (엔티티 계층 구조 기반 테마 적용)
 color_map = {
     "Keyword":         "#8E44AD",   # 짙은 보라 (기준 축)
-    "NewsBatch":       "#b3ffcc",   # 연두 (표시 안됨)
     "NewsArticle":     "#1ABC9C",   # 청록 (정보의 출처)
     
     "Company":         "#E74C3C",   # 빨강 (비즈니스 주체)

@@ -80,22 +80,22 @@
   - 엔티티 동의어 매핑은 코드 외부의 `entity_aliases.json`으로 관리합니다.
 - **[Layer 2] Data Crawlers (`src/core/crawlers/`)**:
   - 신뢰 언론사 화이트리스트(`chosun.com`, `yna.co.kr`, `hankyung.com` 등) 기사만 선별합니다.
-  - TF-IDF + 코사인 유사도 기반으로 중복 기사를 제거하고, 기사를 **10개 단위의 배치(Batch)**로 클러스터링합니다. (`naver_news.py`)
-  - **전역적 기사 고유 인덱싱**: 여러 뉴스가 검색될 때 리트리버가 `[Article_1]`, `[Article_2]` 등으로 기사 번호를 고유하게 재부여하여(Dynamic Re-indexing) LLM의 출처 혼선을 방지합니다.
+  - TF-IDF + 코사인 유사도 기반으로 중복 기사를 제거하고, 개별 기사의 본문을 정제하여 `NewsArticle` 노드에 직접 저장합니다. (`naver_news.py`)
+  - **동적 기사 인덱싱**: 리트리버가 검색 순위별로 `[Article_1]`, `[Article_2]` 등으로 기사 번호를 실시간 부여하여 LLM의 출처 혼선을 방지합니다.
   - 수집 기간은 **달력 일(日) 기준**으로, 1일=오늘, 5일=오늘 포함 과거 5일. (최대 100일)
 - **[Layer 3] Data Processing (`src/core/utils/`)**:
   - 파편화된 엔티티(예: '삼성', '삼전')를 `entity_aliases.json` 매핑 규칙으로 표준화합니다. (`entity_resolution.py`)
 - **[Layer 4] Graph Database & RAG (`src/graphs/`, `src/nodes/`)**:
-  - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 지콌 **검색어별로 누적 적재**합니다.
-  - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, 재검색 시 **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)
-  - `NewsBatch` 노드와 `NewsArticle` 노드를 `[:HAS_SOURCE]`로 명시적으로 연결하여 데이터 출처(Provenance)를 보존합니다.
+  - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 적용하여 **검색어별로 누적 적재**합니다.
+  - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)
+  - 개별 `NewsArticle` 노드에 본문 텍스트와 벡터 임베딩을 통합 저장하여 검색 정밀도를 극대화합니다.
   - Vector / Text-to-Cypher / Hybrid 3가지 경로를 가진 LangGraph 기반 RAG 에이전트를 제공합니다. (`hybrid_rag.py`)
 - **[Layer 5] User Interface (`apps/gui/`)**:
   - `Streamlit` 과 `Pyvis` 기반의 대화형 지식 그래프 대시보드입니다. (`app.py`)
   - **레이아웃**: 상단에 지식 그래프, 하단에 Graph RAG 채팅창을 수직 배치합니다.
   - **엄격한 날짜 필터 기반 그래프**: 날짜 슬라이더를 조정하면 Neo4j 쿼리에 직접 반영하여 해당 기간 기사에서 유래한 관계만 그래프로 표시합니다.
   - **시계열 및 핵심 노드 필터링**: PageRank 상위 N%, 기간 슬라이더, 노드/엣지 유형 필터링 지원.
-  - **정밀 출처 및 새 창 열기**: 답변의 각 문장 끝에 클릭 가능한 마크다운 링크를 생성(`[출처](URL)`)합니다. Neo4j 관계(`[:HAS_SOURCE]`)에서 URL을 직접 추출하여 생성한 **[참조 링크 매핑 테이블]**을 LLM에 제공함으로써 100% 정확한 출처 연결을 보장합니다.
+  - **정밀 출처 및 새 창 열기**: 답변의 각 문장 끝에 클릭 가능한 마크다운 링크(`[출처](URL)`)를 생성합니다. Neo4j `NewsArticle` 노드에서 URL을 직접 추출하여 생성한 **[참조 링크 매핑 테이블]**을 LLM에 제공함으로써 100% 정확한 출처 연결을 보장합니다.
   - **채팅 내역**: 질문-답변을 한 세트로 묶어 최신 대화가 위에 정렬됩니다.
 
 ## 🚀 빠른 시작 가이드 (Quick Start)
@@ -158,8 +158,7 @@ streamlit run apps/gui/app.py
 | 노드 | 역할 |
 |------|------|
 | `Keyword` | 검색어 추적, 날짜별 마지막 수집 시각(Watermark) 저장 |
-| `NewsArticle` | 기사 URL(PK)로 중복 방지 + 증분 기준점 |
-| `NewsBatch` | 10개 기사 단위 LLM 입력 배치. 벡터 검색(RAG)의 기본 단위 |
+| `NewsArticle` | 기사 URL(PK) 기준 중복 방지 + 증분 기준점 + 본문/임베딩 저장 + 벡터 검색(RAG)의 기본 단위 |
 | `Entity` 계열 | `Company`, `Industry`, `MacroEvent`, `Product` 타입. 키워드 무관 공유 → 크로스-키워드 분석 |
 
 ---
@@ -197,4 +196,3 @@ streamlit run apps/gui/app.py
   - 'HBM3E → 메모리반도체 → 시스템반도체'와 같은 상하위 범주 트리 도입
 - [ ] **감성 점수(Sentiment Score) 기반 분석 및 시각화**
   - LLM을 통한 엔티티별 감성 추출 도입 및 대시보드 내 노드 색상/크기 반영
-
