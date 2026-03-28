@@ -3,6 +3,7 @@ from typing import Annotated, TypedDict, List, Dict, Any, Optional
 
 class AgentState(TypedDict):
     question: str
+    current_keyword: str        # 현재 사용자가 보고 있는 검색어 스코프
     route: str                 # 'vector', 'text2cypher', 'vector_cypher'
     
     # Text2Cypher 및 VectorCypher에서 사용될 필드

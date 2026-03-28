@@ -1,0 +1,66 @@
+{
+  "소프트웨어 기술": {
+    "type": "Technology",
+    "aliases": [],
+    "parents": []
+  },
+  "AI": {
+    "type": "Technology",
+    "aliases": ["인공지능", "Artificial Intelligence"],
+    "parents": [
+      { "name": "소프트웨어 기술", "type": "Technology", "relation": "PART_OF" }
+    ]
+  },
+  "생성형 AI": {
+    "type": "Technology",
+    "aliases": ["Generative AI", "생성형AI"],
+    "parents": [
+      { "name": "AI", "type": "Technology", "relation": "PART_OF" }
+    ]
+  },
+  "LLM": {
+    "type": "Technology",
+    "aliases": ["Large Language Model", "대규모 언어 모델"],
+    "parents": [
+      { "name": "생성형 AI", "type": "Technology", "relation": "PART_OF" }
+    ]
+  },
+  "컴퓨팅 기기": {
+    "type": "Product",
+    "aliases": [],
+    "parents": []
+  },
+  "PC": {
+    "type": "Product",
+    "aliases": [],
+    "parents": [
+      { "name": "컴퓨팅 기기", "type": "Product", "relation": "PART_OF" }
+    ]
+  },
+  "모바일 기기": {
+    "type": "Product",
+    "aliases": [],
+    "parents": [
+      { "name": "컴퓨팅 기기", "type": "Product", "relation": "PART_OF" }
+    ]
+  },
+  "스마트폰": {
+    "type": "Product",
+    "aliases": [],
+    "parents": [
+      { "name": "모바일 기기", "type": "Product", "relation": "PART_OF" }
+    ]
+  },
+  "거시경제": {
+    "type": "MacroEvent",
+    "aliases": [],
+    "parents": []
+  },
+  "인플레이션": {
+    "type": "MacroEvent",
+    "aliases": [],
+    "parents": [
+      { "name": "거시경제", "type": "MacroEvent", "relation": "PART_OF" }
+    ]
+  }
+}

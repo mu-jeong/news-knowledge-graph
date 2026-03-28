@@ -82,12 +82,15 @@ def run_pipeline(keyword: str, days_back: int = 7):
             # 케이스 1: API에서 기사는 가져왔거나(all_urls), 워터마크에 의해 모두 필터링된 경우(watermarks)
             if all_urls or watermarks:
                 log.append(f"  → ✨ **이미 최신 지식이 반영되어 있습니다.** (금일 요청 범위에서 새로 발행된 기사가 없습니다.)")
-                log.append("  💡 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+                log.append("  💡 기존 그래프와 검색 컨텍스트를 그대로 사용합니다. 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+                log.append(f"\n🎉 **파이프라인 완료!** 기존 데이터를 기준으로 그래프를 표시합니다.")
+                yield "\n".join(log)
+                yield True
             # 케이스 2: API 결과 자체가 없고 기존 수집 이력도 없는 경우
             else:
                 log.append("  → ❌ **수집된 기사가 전혀 없습니다.** (키워드 오타, 네이버 서버 일시 오류, 혹은 수집 허용 언론사에 해당 뉴스가 없을 수 있음)")
-            
-            yield "\n".join(log)
+                yield "\n".join(log)
+                yield False
             return
              
         # 새로운 기사가 있다면 배치를 재생성 (원래 batches는 raw_articles 기준이므로 걸러야 함)
@@ -100,6 +103,7 @@ def run_pipeline(keyword: str, days_back: int = 7):
     except Exception as e:
         log.append(f"  → ⚠️ 수집 중 예외 발생: {e}")
         yield "\n".join(log)
+        yield False
         return
 
     log.append(f"  → 📡 {len(all_urls)}개 기사 중 **신규 {len(article_metadata)}개** 발견 (나머지 중복은 제외)")
@@ -177,11 +181,13 @@ def run_pipeline(keyword: str, days_back: int = 7):
         error_msg = f"  → ❌ 적재 오류: {e}\n\n```\n{traceback.format_exc()}\n```"
         log.append(error_msg)
         yield "\n".join(log)
-        return False # 실패 반환
+        yield False
+        return
 
     log.append(f"\n🎉 **파이프라인 완료!** 아래 그래프가 자동으로 갱신됩니다.")
     yield "\n".join(log)
-    return True # 성공 반환
+    yield True
+    return
 
 
 
@@ -221,20 +227,28 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                 // 1. 엔티티 관계 조회
                 MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+{date_filter}                OPTIONAL MATCH (a)-[:MENTIONS]->(e:Entity)
+                WITH collect(distinct a.id) AS article_ids,
+                     collect(distinct a.title) AS article_titles,
+                     collect(distinct e.id) AS entity_ids
                 
                 MATCH (n:Entity)-[r]->(m:Entity)
-                WHERE r.source_url IN article_ids 
-                   OR r.source_article IN article_titles
+                WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
+                WHERE coalesce(rel_props['source_url'], '') IN article_ids 
+                   OR (
+                        coalesce(rel_props['source_url'], '') = ''
+                        AND coalesce(rel_props['source_article'], '') IN article_titles
+                   )
+                   OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 
                 RETURN n.id AS source, 
                        head([lbl IN labels(n) WHERE lbl <> 'Entity']) AS source_type,
                        m.id AS target, 
                        head([lbl IN labels(m) WHERE lbl <> 'Entity']) AS target_type,
                        type(r) AS edge_type,
-                       r.source_url AS source_url,
+                       rel_props['source_url'] AS source_url,
                        r.description AS description,
-                       COALESCE(r.source_article, '정보 없음') AS source_article
+                       COALESCE(rel_props['source_article'], CASE WHEN coalesce(rel_props['provenance'], '') = 'taxonomy' THEN 'taxonomy' ELSE '정보 없음' END) AS source_article
                 
                 UNION
                 
@@ -252,11 +266,19 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
             centrality = {r["node_id"]: r["degree"] for r in session.run(f"""
                 MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+{date_filter}                OPTIONAL MATCH (a)-[:MENTIONS]->(e:Entity)
+                WITH collect(distinct a.id) AS article_ids,
+                     collect(distinct a.title) AS article_titles,
+                     collect(distinct e.id) AS entity_ids
                 
                 MATCH (n:Entity)-[r]-(m:Entity)
-                WHERE r.source_url IN article_ids 
-                   OR r.source_article IN article_titles
+                WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
+                WHERE coalesce(rel_props['source_url'], '') IN article_ids 
+                   OR (
+                        coalesce(rel_props['source_url'], '') = ''
+                        AND coalesce(rel_props['source_article'], '') IN article_titles
+                   )
+                   OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 RETURN n.id AS node_id, count(r) AS degree
             """, **params)}
         loader.close()
@@ -334,12 +356,14 @@ with st.sidebar:
 - 🟢 **청록색**: 뉴스 기둥 (NewsArticle)
 
 **2. 비즈니스 코어 (주요 분석 대상)**
-- 🔴 **빨간색**: 기업 (Company)
-- 🔵 **파란색**: 산업 생태계 (Industry)
+- 🔴 **코랄 레드**: 기업 (Company)
+- 🔵 **선명한 파랑**: 산업 생태계 (Industry)
 - 🟠 **주황색**: 기업의 제품/서비스 (Product)
+- 🩵 **시안색**: 기술/기술 영역 (Technology)
 
 **3. 외부 환경 및 기타**
-- 🟡 **노란색(Gold)**: 거시경제/외부 충격 (MacroEvent)
+- 🟡 **골드색**: 거시경제/외부 충격 (MacroEvent)
+- 🟩 **라임색**: 리스크 요인 (RiskFactor)
 - ⚪ **회색**: 미분류 일반 명사 (Entity)
 
 ---
@@ -358,7 +382,7 @@ with st.sidebar:
     st.markdown("**관계 유형** (검색 후 선택 가능)")
     _et_placeholder = st.empty()
     st.markdown("**노드 유형**")
-    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "MacroEvent", "NewsArticle", "Entity"]
+    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "Technology", "MacroEvent", "RiskFactor", "NewsArticle", "Entity"]
     # NewsArticle은 기본적으로 제외 (사용자 요청)
     default_node_types = [t for t in all_node_type_options if t != "NewsArticle"]
     selected_node_types = st.multiselect(
@@ -396,10 +420,10 @@ if run_btn and search_input.strip():
     with st.spinner("파이프라인 실행 중..."):
         pipeline_success = False
         for log_msg in run_pipeline(keyword, days_back=int(days_input)):
+            if isinstance(log_msg, bool):
+                pipeline_success = log_msg
+                continue
             log_area.markdown(log_msg)
-            # 마지막 yield 값이 True/False라면 성공 여부 판단
-            if log_msg is True: pipeline_success = True
-            if log_msg is False: pipeline_success = False
 
     if pipeline_success:
         st.success("✅ 완료! 그래프가 아래에 표시됩니다.")
@@ -496,15 +520,6 @@ with st.sidebar:
 
 st.caption("파란색 엣지를 클릭하면 연결된 기사 원문으로 이동합니다.")
 
-# 그래프 빌드
-color_map = {
-    "Company": "#FF9999",
-    "Person": "#99CC99",
-    "Technology": "#9999FF",
-    "Product": "#FFCC99",
-    "Country": "#FFFF99",
-}
-
 net = Network(height="600px", width="100%", bgcolor="#1a1a2e",
               font_color="white", directed=True)
 net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
@@ -513,14 +528,16 @@ net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
 # 노드 색상 맵 (엔티티 계층 구조 기반 테마 적용)
 color_map = {
     "Keyword":         "#8E44AD",   # 짙은 보라 (기준 축)
-    "NewsArticle":     "#1ABC9C",   # 청록 (정보의 출처)
+    "NewsArticle":     "#16A085",   # 청록 (정보의 출처)
     
-    "Company":         "#E74C3C",   # 빨강 (비즈니스 주체)
-    "Industry":        "#2980B9",   # 짙은 파랑 (산업 생태계)
-    "Product":         "#F39C12",   # 주황 (출시 제품)
+    "Company":         "#FF6B6B",   # 코랄 레드 (비즈니스 주체)
+    "Industry":        "#4D96FF",   # 선명한 파랑 (산업 생태계)
+    "Product":         "#FF9F1C",   # 주황 (출시 제품)
+    "Technology":      "#2EC4F6",   # 시안 (기술 영역)
     
-    "MacroEvent":      "#F1C40F",   # 노랑/골드 (거시 충격)
-    "Entity":          "#95A5A6",   # 회색 (미분류)
+    "MacroEvent":      "#FFD166",   # 골드 (거시 충격)
+    "RiskFactor":      "#9FD356",   # 라임 (리스크)
+    "Entity":          "#B0B7C3",   # 밝은 회색 (미분류)
 }
 
 
@@ -652,6 +669,8 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
+if "chat_scope_keyword" not in st.session_state:
+    st.session_state.chat_scope_keyword = ""
 
 # 1. 검색창을 상단에 배치 (고정된 느낌을 주기 위해 container 사용)
 input_container = st.container()
@@ -662,6 +681,16 @@ chat_container = st.container()
 
 # 입력 및 응답 생성 로직
 if prompt:
+    active_keyword = search_input.strip() if search_input else ""
+    if not active_keyword:
+        st.warning("질문 전에 먼저 검색어를 입력하고 그래프를 생성해 주세요.")
+        st.stop()
+
+    if st.session_state.chat_scope_keyword != active_keyword:
+        st.session_state.messages = []
+        st.session_state.thread_id = str(uuid.uuid4())
+        st.session_state.chat_scope_keyword = active_keyword
+
     # 사용자 메시지 추가 (메시지 리스트의 맨 뒤에 추가하지만 출력은 역순으로 함)
     st.session_state.messages.append({"role": "user", "content": prompt})
     
@@ -671,7 +700,12 @@ if prompt:
             with st.spinner("AI가 최적의 검색 경로를 찾고 있습니다... 🔍"):
                 config = {"configurable": {"thread_id": st.session_state.thread_id}}
                 try:
-                    result = rag_app.invoke({"question": prompt, "retry_count": 0, "final_answer": None}, config=config)
+                    result = rag_app.invoke({
+                        "question": prompt,
+                        "current_keyword": active_keyword,
+                        "retry_count": 0,
+                        "final_answer": None
+                    }, config=config)
                     
                     # Cypher 검증 실패 시 final_answer에 에러 메시지가 담겨옴
                     final_answer = result.get("final_answer")

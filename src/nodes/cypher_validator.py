@@ -59,7 +59,7 @@ def _is_read_only(query: str) -> tuple[bool, str]:
     return True, ""
 
 
-def _check_syntax(query: str) -> tuple[bool, str]:
+def _check_syntax(query: str, current_keyword: str = "") -> tuple[bool, str]:
     """
     Neo4j EXPLAIN을 활용해 문법 오류를 사전 탐지합니다.
     실제 데이터를 읽지 않으므로 안전합니다.
@@ -67,7 +67,8 @@ def _check_syntax(query: str) -> tuple[bool, str]:
     try:
         driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         with driver.session() as session:
-            session.run(f"EXPLAIN {query}")
+            params = {"current_keyword": current_keyword} if current_keyword else {}
+            session.run(f"EXPLAIN {query}", **params)
         driver.close()
         return True, ""
     except Exception as e:
@@ -83,6 +84,7 @@ def cypher_validator_node(state: AgentState) -> dict:
     """
     cypher = state.get("generated_cypher", "").strip()
     retry_count = state.get("retry_count", 0)
+    current_keyword = state.get("current_keyword", "")
 
     # --- 검증 1: 읽기 전용 여부 ---
     is_safe, reason = _is_read_only(cypher)
@@ -90,8 +92,13 @@ def cypher_validator_node(state: AgentState) -> dict:
         print(f"🚫 [CypherValidator] 보안 위반 감지 ({retry_count+1}회): {reason}")
         return _handle_failure(reason, retry_count, cypher)
 
+    if current_keyword and "$current_keyword" not in cypher:
+        reason = "현재 검색어 범위 제한이 없는 Cypher입니다. `$current_keyword`를 사용해야 합니다."
+        print(f"🚫 [CypherValidator] 스코프 누락 감지 ({retry_count+1}회): {reason}")
+        return _handle_failure(reason, retry_count, cypher)
+
     # --- 검증 2: Neo4j 문법 오류 ---
-    is_valid_syntax, err_msg = _check_syntax(cypher)
+    is_valid_syntax, err_msg = _check_syntax(cypher, current_keyword=current_keyword)
     if not is_valid_syntax:
         print(f"❌ [CypherValidator] 문법 오류 ({retry_count+1}회): {err_msg}")
         return _handle_failure(err_msg, retry_count, cypher)

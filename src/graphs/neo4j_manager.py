@@ -123,7 +123,6 @@ class Neo4jLoader:
                         a.title = $title,
                         a.published_at = $published_at,
                         a.keyword = $keyword
-                    SET a:Entity 
                     
                     WITH k, a
                     // 3. 관계 연결
@@ -200,21 +199,30 @@ class Neo4jLoader:
                 if not edge_type: edge_type = "RELATED_TO"
 
                 # 엔티티 간의 관계 생성 및 원본 기사 직결
-                rel_query = f"""
+                rel_query = """
                 MATCH (s:Entity) WHERE s.id = $s_name OR s.name = $s_name
                 MATCH (t:Entity) WHERE t.id = $t_name OR t.name = $t_name
-                MATCH (a:NewsArticle {{id: $s_url}})
                 
-                MERGE (s)-[r:{edge_type}]->(t)
+                MERGE (s)-[r:__EDGE_TYPE__]->(t)
                 SET r.description = $desc, 
-                    r.source_url = $s_url, 
-                    r.source_article = $s_art
+                    r.source_url = CASE WHEN $s_url IS NOT NULL AND $s_url <> '' THEN $s_url ELSE r.source_url END,
+                    r.source_article = CASE WHEN $s_art IS NOT NULL AND $s_art <> '' THEN $s_art ELSE r.source_article END,
+                    r.article_id = CASE WHEN $article_id IS NOT NULL AND $article_id <> '' THEN $article_id ELSE r.article_id END,
+                    r.provenance = CASE WHEN $prov IS NOT NULL AND $prov <> '' THEN $prov ELSE coalesce(r.provenance, 'article') END
                 
-                // 기사와 엔티티 간의 MENTIONS 관계도 동시에 생성
-                MERGE (a)-[:MENTIONS]->(s)
-                MERGE (a)-[:MENTIONS]->(t)
+                WITH s, t
+                OPTIONAL MATCH (a:NewsArticle {id: $s_url})
+                FOREACH (_ IN CASE WHEN a IS NULL THEN [] ELSE [1] END |
+                    MERGE (a)-[:MENTIONS]->(s)
+                    MERGE (a)-[:MENTIONS]->(t)
+                )
                 """
+                rel_query = rel_query.replace("__EDGE_TYPE__", edge_type)
                 session.run(rel_query, 
                     s_name=rel.source.strip(), t_name=rel.target.strip(),
-                    desc=rel.description, s_url=rel.source_url, s_art=rel.source_article
+                    desc=rel.description,
+                    s_url=rel.source_url,
+                    s_art=rel.source_article,
+                    article_id=rel.article_id,
+                    prov=rel.provenance,
                 )

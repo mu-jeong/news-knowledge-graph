@@ -11,6 +11,7 @@ def generator_node(state: AgentState) -> dict:
     """
     question = state.get("question", "")
     route = state.get("route", "")
+    current_keyword = state.get("current_keyword", "")
     context = state.get("search_context", "")
     source_links = state.get("source_links", {})
 
@@ -33,6 +34,9 @@ def generator_node(state: AgentState) -> dict:
     
     [질문]
     {question}
+
+    [현재 검색어 범위]
+    {current_keyword}
     
     [참조 링크 매핑 테이블]
     {links_table}
@@ -42,6 +46,10 @@ def generator_node(state: AgentState) -> dict:
 
     [제공된 검색 내용]
     {context}
+
+    [추가 제약]
+    - 반드시 현재 검색어 범위 안에서만 답변하세요.
+    - 현재 검색어와 무관한 기업/산업/기사 내용은 답변에 포함하지 마세요.
     
     답변:
     """
