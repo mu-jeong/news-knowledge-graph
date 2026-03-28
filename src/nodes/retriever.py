@@ -97,8 +97,11 @@ def text2cypher_retriever_node(state: AgentState) -> dict:
     - Industry
     - NewsArticle
     - MacroEvent
+    - Product
+    - Technology
+    - RiskFactor
     
-    Relationship types: MENTIONS, SUPPLIES_TO, COMPETES_WITH, OWNS, RELATED_TO, etc.
+    Relationship types: MENTIONS, SUPPLIES_TO, COMPETES_WITH, BELONGS_TO, PART_OF, RELEASED, USES, EXPOSED_TO, BENEFITS_FROM, AFFECTS, OWNS, RELATED_TO, etc.
     ※ 관계성(Edge) 정보 추출 시, 가급적 관계의 속성인 `source_url`도 함께 RETURN 하도록 작성하세요.
     """
     

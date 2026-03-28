@@ -82,6 +82,12 @@ LLM_MAX_WORKERS: int = 5
 # 클수록 LLM 호출 횟수가 줄지만 컨텍스트 길이가 늘어남
 BATCH_SIZE: int = int(os.getenv("BATCH_SIZE", 10))
 
+# 엔티티 의미 기반 병합 사용 여부
+ENABLE_ENTITY_SEMANTIC_MERGE: bool = os.getenv("ENABLE_ENTITY_SEMANTIC_MERGE", "1") == "1"
+
+# 엔티티 의미 기반 병합 임계값
+ENTITY_SEMANTIC_MERGE_THRESHOLD: float = float(os.getenv("ENTITY_SEMANTIC_MERGE_THRESHOLD", "0.9"))
+
 
 # ──────────────────────────────────────────
 # 그래프 표시 설정 (app.py)

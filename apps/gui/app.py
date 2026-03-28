@@ -221,20 +221,25 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                 // 1. 엔티티 관계 조회
                 MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+{date_filter}                OPTIONAL MATCH (a)-[:MENTIONS]->(e:Entity)
+                WITH collect(distinct a.id) AS article_ids,
+                     collect(distinct a.title) AS article_titles,
+                     collect(distinct e.id) AS entity_ids
                 
                 MATCH (n:Entity)-[r]->(m:Entity)
-                WHERE r.source_url IN article_ids 
-                   OR r.source_article IN article_titles
+                WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
+                WHERE coalesce(rel_props['source_url'], '') IN article_ids 
+                   OR coalesce(rel_props['source_article'], '') IN article_titles
+                   OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 
                 RETURN n.id AS source, 
                        head([lbl IN labels(n) WHERE lbl <> 'Entity']) AS source_type,
                        m.id AS target, 
                        head([lbl IN labels(m) WHERE lbl <> 'Entity']) AS target_type,
                        type(r) AS edge_type,
-                       r.source_url AS source_url,
+                       rel_props['source_url'] AS source_url,
                        r.description AS description,
-                       COALESCE(r.source_article, '정보 없음') AS source_article
+                       COALESCE(rel_props['source_article'], CASE WHEN coalesce(rel_props['provenance'], '') = 'taxonomy' THEN 'taxonomy' ELSE '정보 없음' END) AS source_article
                 
                 UNION
                 
@@ -252,11 +257,16 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
             centrality = {r["node_id"]: r["degree"] for r in session.run(f"""
                 MATCH (k:Keyword {{name: $keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
                 WHERE 1=1
-{date_filter}                WITH collect(distinct a.id) AS article_ids, collect(distinct a.title) AS article_titles
+{date_filter}                OPTIONAL MATCH (a)-[:MENTIONS]->(e:Entity)
+                WITH collect(distinct a.id) AS article_ids,
+                     collect(distinct a.title) AS article_titles,
+                     collect(distinct e.id) AS entity_ids
                 
                 MATCH (n:Entity)-[r]-(m:Entity)
-                WHERE r.source_url IN article_ids 
-                   OR r.source_article IN article_titles
+                WITH article_ids, article_titles, entity_ids, n, r, m, properties(r) AS rel_props
+                WHERE coalesce(rel_props['source_url'], '') IN article_ids 
+                   OR coalesce(rel_props['source_article'], '') IN article_titles
+                   OR (coalesce(rel_props['provenance'], '') = 'taxonomy' AND (n.id IN entity_ids OR m.id IN entity_ids))
                 RETURN n.id AS node_id, count(r) AS degree
             """, **params)}
         loader.close()
@@ -334,12 +344,14 @@ with st.sidebar:
 - 🟢 **청록색**: 뉴스 기둥 (NewsArticle)
 
 **2. 비즈니스 코어 (주요 분석 대상)**
-- 🔴 **빨간색**: 기업 (Company)
-- 🔵 **파란색**: 산업 생태계 (Industry)
+- 🔴 **코랄 레드**: 기업 (Company)
+- 🔵 **선명한 파랑**: 산업 생태계 (Industry)
 - 🟠 **주황색**: 기업의 제품/서비스 (Product)
+- 🩵 **시안색**: 기술/기술 영역 (Technology)
 
 **3. 외부 환경 및 기타**
-- 🟡 **노란색(Gold)**: 거시경제/외부 충격 (MacroEvent)
+- 🟡 **골드색**: 거시경제/외부 충격 (MacroEvent)
+- 🟩 **라임색**: 리스크 요인 (RiskFactor)
 - ⚪ **회색**: 미분류 일반 명사 (Entity)
 
 ---
@@ -358,7 +370,7 @@ with st.sidebar:
     st.markdown("**관계 유형** (검색 후 선택 가능)")
     _et_placeholder = st.empty()
     st.markdown("**노드 유형**")
-    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "MacroEvent", "NewsArticle", "Entity"]
+    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "Technology", "MacroEvent", "RiskFactor", "NewsArticle", "Entity"]
     # NewsArticle은 기본적으로 제외 (사용자 요청)
     default_node_types = [t for t in all_node_type_options if t != "NewsArticle"]
     selected_node_types = st.multiselect(
@@ -496,15 +508,6 @@ with st.sidebar:
 
 st.caption("파란색 엣지를 클릭하면 연결된 기사 원문으로 이동합니다.")
 
-# 그래프 빌드
-color_map = {
-    "Company": "#FF9999",
-    "Person": "#99CC99",
-    "Technology": "#9999FF",
-    "Product": "#FFCC99",
-    "Country": "#FFFF99",
-}
-
 net = Network(height="600px", width="100%", bgcolor="#1a1a2e",
               font_color="white", directed=True)
 net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
@@ -513,14 +516,16 @@ net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
 # 노드 색상 맵 (엔티티 계층 구조 기반 테마 적용)
 color_map = {
     "Keyword":         "#8E44AD",   # 짙은 보라 (기준 축)
-    "NewsArticle":     "#1ABC9C",   # 청록 (정보의 출처)
+    "NewsArticle":     "#16A085",   # 청록 (정보의 출처)
     
-    "Company":         "#E74C3C",   # 빨강 (비즈니스 주체)
-    "Industry":        "#2980B9",   # 짙은 파랑 (산업 생태계)
-    "Product":         "#F39C12",   # 주황 (출시 제품)
+    "Company":         "#FF6B6B",   # 코랄 레드 (비즈니스 주체)
+    "Industry":        "#4D96FF",   # 선명한 파랑 (산업 생태계)
+    "Product":         "#FF9F1C",   # 주황 (출시 제품)
+    "Technology":      "#2EC4F6",   # 시안 (기술 영역)
     
-    "MacroEvent":      "#F1C40F",   # 노랑/골드 (거시 충격)
-    "Entity":          "#95A5A6",   # 회색 (미분류)
+    "MacroEvent":      "#FFD166",   # 골드 (거시 충격)
+    "RiskFactor":      "#9FD356",   # 라임 (리스크)
+    "Entity":          "#B0B7C3",   # 밝은 회색 (미분류)
 }
 
 

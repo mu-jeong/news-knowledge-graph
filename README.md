@@ -76,15 +76,16 @@
 
 - **[Layer 1] Config & Schema (`src/configs/`)**:
   - `Pydantic` 스키마 템플릿을 통해 LLM 환각(Hallucination)을 막고 엄격하게 파싱된 노드/엣지(Entity & Relation) 데이터를 추출합니다.
-  - 추출 대상 엔티티: `Company`, `Industry`, `MacroEvent`, `Product`
-  - 엔티티 동의어 매핑은 코드 외부의 `entity_aliases.json`으로 관리합니다.
+  - 추출 대상 엔티티: `Company`, `Industry`, `MacroEvent`, `Product`, `Technology`, `RiskFactor`
+  - 관리형 관계 타입: `SUPPLIES_TO`, `COMPETES_WITH`, `BELONGS_TO`, `PART_OF`, `RELEASED`, `USES`, `EXPOSED_TO`, `BENEFITS_FROM`, `AFFECTS`, `OWNS`, `RELATED_TO`, `MENTIONS`
+  - 엔티티 정규화는 `entity_aliases.json`의 별칭 규칙과 `entity_taxonomy.json`의 canonical taxonomy를 함께 사용합니다.
 - **[Layer 2] Data Crawlers (`src/core/crawlers/`)**:
   - 신뢰 언론사 화이트리스트(`chosun.com`, `yna.co.kr`, `hankyung.com` 등) 기사만 선별합니다.
   - TF-IDF + 코사인 유사도 기반으로 중복 기사를 제거하고, 개별 기사의 본문을 정제하여 `NewsArticle` 노드에 직접 저장합니다. (`naver_news.py`)
   - **동적 기사 인덱싱**: 리트리버가 검색 순위별로 `[Article_1]`, `[Article_2]` 등으로 기사 번호를 실시간 부여하여 LLM의 출처 혼선을 방지합니다.
   - 수집 기간은 **달력 일(日) 기준**으로, 1일=오늘, 5일=오늘 포함 과거 5일. (최대 100일)
 - **[Layer 3] Data Processing (`src/core/utils/`)**:
-  - 파편화된 엔티티(예: '삼성', '삼전')를 `entity_aliases.json` 매핑 규칙으로 표준화합니다. (`entity_resolution.py`)
+  - 파편화된 엔티티(예: '삼성', '삼전')를 `entity_aliases.json` 매핑 규칙으로 표준화하고, taxonomy 기반 상위 개념과 provenance를 함께 정리합니다. (`entity_resolution.py`)
 - **[Layer 4] Graph Database & RAG (`src/graphs/`, `src/nodes/`)**:
   - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 적용하여 **검색어별로 누적 적재**합니다.
   - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)
@@ -159,7 +160,7 @@ streamlit run apps/gui/app.py
 |------|------|
 | `Keyword` | 검색어 추적, 날짜별 마지막 수집 시각(Watermark) 저장 |
 | `NewsArticle` | 기사 URL(PK) 기준 중복 방지 + 증분 기준점 + 본문/임베딩 저장 + 벡터 검색(RAG)의 기본 단위 |
-| `Entity` 계열 | `Company`, `Industry`, `MacroEvent`, `Product` 타입. 키워드 무관 공유 → 크로스-키워드 분석 |
+| `Entity` 계열 | `Company`, `Industry`, `MacroEvent`, `Product`, `Technology`, `RiskFactor` 타입. taxonomy 관계와 기사 provenance를 함께 보존하며 키워드 무관 공유 → 크로스-키워드 분석 |
 
 ---
 
@@ -174,11 +175,13 @@ streamlit run apps/gui/app.py
 - [x] **워터마크(Watermark) 기반 스마트 증분 수집 (Smart Incremental Fetch)**
   - 키워드별 날짜별 마지막 수집 시각을 Neo4j에 저장, 실제 수집된 기사의 날짜만 업데이트하여 누락 없는 증분 수집 구현
 - [x] **엔티티 별칭 외부 관리 (External Entity Alias Config)**
-  - `entity_aliases.json`으로 코드 수정 없이 동의어 매핑 추가 가능\
+  - `entity_aliases.json`으로 코드 수정 없이 동의어 매핑 추가 가능
+- [x] **온톨로지 v1 확장 (Ontology v1 Expansion)**
+  - `Technology`, `RiskFactor` 타입 추가, 관리형 관계 타입 정리, taxonomy/provenance 기반 엔티티 정규화 도입
 - [x] **노드 스타일 통일 (Node Style Unification)**
   - 모든 노드를 원형 스타일로 통일하고 엔티티 계층에 맞는 테마 색상 적용. `NewsArticle` 노드는 기본적으로 필터에서 허용 해제
 - [x] **엄격한 날짜 필터 기반 그래프 (Strict Date-Filtered Graph)**
-  - 날짜 필터를 그래프 쿼리에 직접 반영하여 선택된 기간의 기사에서 유래한 관계만 시각화 (ꭐ, 날짜 외 조건으로 인한 데이터 오염 제거)
+  - 날짜 필터를 그래프 쿼리에 직접 반영하여 선택된 기간의 기사에서 유래한 관계만 시각화 (날짜 외 조건으로 인한 데이터 오염 제거)
 - [x] **기사 단위 배치처리 + 출처 정밀화 (Article-level Batch & Precision Citation)**
   - 기사 10개 단위 배치, `[Article_N]` ID 부여로 LLM이 각 문장의 출처를 명시하도록 강제. 답변에 인용된 기사만 정밀하게 출처로 표시
 - [x] **Cypher Injection 방어 + 피드백 루프 (Cypher Validator with Feedback Loop)**
@@ -187,12 +190,14 @@ streamlit run apps/gui/app.py
 - [ ] **엔티티 별칭 설정 변경 시 노드 자동 병합 (Neo4j Sync)**
   - `entity_aliases.json`의 변경 사항을 감지하여 `apoc.refactor.mergeNodes` 기반 자동 DB 리팩토링
 - [ ] **AI 기반 엔티티 정규화 고도화 (Advanced Entity Resolution)**
-  - 임베딩 기반 군집화 + LLM 검증 하이브리드 파이프라인
+  - 현재의 taxonomy + semantic merge를 넘어, 임베딩 기반 군집화 + LLM 검증까지 포함한 고도화 파이프라인
+- [ ] **Seed Ontology 확장 워크플로우**
+  - taxonomy 미등록 엔티티를 후보로 수집하고, 임베딩/LLM 기반 상위 개념 추천 후 검토·승인 과정을 거쳐 ontology에 편입
 - [ ] **정교한 관계 속성 및 가중치 추출 (Rich Edge Attributes)**
   - 관계 감성(긍정/부정) 및 파급 강도(Weight)를 엣지 속성으로 반영
 - [ ] **동적 인사이트 요약 리포트 자동 생성 (Insight Generation)**
   - 특정 기간 Sub-graph를 LLM에 전달하여 신규 테마 이슈 브리핑 자동 발행
-- [ ] **도메인 특화 온톨로지(Ontology) 모델링 고도화**
-  - 'HBM3E → 메모리반도체 → 시스템반도체'와 같은 상하위 범주 트리 도입
+- [ ] **대규모 도메인 taxonomy 확장**
+  - 현재 taxonomy scaffold를 넘어, 'HBM3E → 메모리반도체 → 시스템반도체'와 같은 더 넓은 상하위 범주 트리 도입
 - [ ] **감성 점수(Sentiment Score) 기반 분석 및 시각화**
   - LLM을 통한 엔티티별 감성 추출 도입 및 대시보드 내 노드 색상/크기 반영
