@@ -10,8 +10,9 @@ class AgentState(TypedDict):
     generated_cypher: str          # LLM이 작성한 Cypher 쿼리
     cypher_result: List[Dict]      # DB에서 조회된 관계 정보 리스트
     
-    # Vector 및 VectorCypher에서 사용될 본문 텍스트 (FAISS 또는 Neo4j NewsBatch)
+    # Vector 및 VectorCypher에서 사용될 본문 텍스트 (Neo4j NewsArticle 기반)
     search_context: str            # 최종적으로 생성기(Generator)에 넘길 참조 컨텍스트 모음
+    source_links: Dict[str, str]   # 기사 ID([Article_N])와 URL 매핑 테이블 (정밀 출처용)
     
     generation: str            # 최종 답변
     chat_history: Annotated[list, operator.add]  # 대화 기록

@@ -12,6 +12,10 @@ def generator_node(state: AgentState) -> dict:
     question = state.get("question", "")
     route = state.get("route", "")
     context = state.get("search_context", "")
+    source_links = state.get("source_links", {})
+
+    # 매핑 테이블을 문자열로 변환
+    links_table = "\n".join([f"- {k}: {v}" for k, v in source_links.items()])
 
     llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0.2)
     
@@ -24,11 +28,14 @@ def generator_node(state: AgentState) -> dict:
     [중요 가이드라인]
     1. 각 문장 끝에 반드시 출처를 명시하세요.
     2. 출처는 <a href="기사 URL" target="_blank">[출처]</a> 형식의 HTML 링크로 작성하여 클릭 시 새 창에서 열리도록 하세요. (백틱이나 코드 블록 없이 태그만 직접 작성하세요.)
-    3. 기사 URL은 제공된 지식(Context)의 각 항목에 있는 `링크:` 또는 `source_url` 필드의 값을 정확히 사용하세요.
+    3. 기사 URL은 아래 제공된 [참조 링크 매핑 테이블]을 참고하여, 원문의 [Article_N] 번호에 맞는 정확한 URL을 삽입하십시오.
     4. 내용에 실제로 인용된 기사만 출처로 포함하여 정보의 정확도를 높이세요.
     
     [질문]
     {question}
+    
+    [참조 링크 매핑 테이블]
+    {links_table}
     
     [사용된 검색 경로 판단]
     {route} (이 경로로 검색된 데이터를 신뢰하여 답변하세요.)
