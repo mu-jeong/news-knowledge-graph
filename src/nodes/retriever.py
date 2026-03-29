@@ -73,10 +73,10 @@ def vector_retriever_node(state: AgentState) -> dict:
         with driver.session() as session:
             result = session.run("""
                 MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(scoped:NewsArticle)
-                WITH collect(id(scoped)) AS scoped_ids
-                CALL db.index.vector.queryNodes('article_embedding', 30, $query_vector)
+                WITH collect(scoped.id) AS scoped_ids
+                CALL db.index.vector.queryNodes('article_embedding', 10, $query_vector)
                 YIELD node, score
-                WHERE id(node) IN scoped_ids
+                WHERE node.id IN scoped_ids
                 RETURN node.text AS text, [node.id] AS urls, score
                 ORDER BY score DESC
                 LIMIT 10

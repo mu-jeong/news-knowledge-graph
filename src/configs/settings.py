@@ -99,14 +99,8 @@ SEED_TAXONOMY_PATH: str = os.getenv(
     os.path.join(BASE_DIR, "src", "configs", "entity_taxonomy.json"),
 )
 
-# 사용자 확장 taxonomy 경로
-USER_TAXONOMY_PATH: str = os.getenv(
-    "USER_TAXONOMY_PATH",
-    os.path.join(BASE_DIR, "src", "configs", "entity_taxonomy.user.json"),
-)
-
 # ontology 후보 수집 사용 여부
-ENABLE_ONTOLOGY_CANDIDATE_CAPTURE: bool = os.getenv("ENABLE_ONTOLOGY_CANDIDATE_CAPTURE", "1") == "1"
+ENABLE_ONTOLOGY_CANDIDATE_CAPTURE: bool = os.getenv("ENABLE_ONTOLOGY_CANDIDATE_CAPTURE", "0") == "1"
 
 # taxonomy 미등록 엔티티 후보 레지스트리 경로
 ONTOLOGY_CANDIDATE_REGISTRY_PATH: str = os.getenv(

@@ -19,7 +19,6 @@ from src.configs.settings import (
     ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT,
     ONTOLOGY_PARENT_SUGGESTION_THRESHOLD,
     SEED_TAXONOMY_PATH,
-    USER_TAXONOMY_PATH,
 )
 
 class EntityResolver:
@@ -297,24 +296,11 @@ class EntityResolver:
             print(f"⚠️ Taxonomy 설정을 불러오는데 실패했습니다 ({config_path}): {e}")
             return {}
 
-    def _merge_taxonomy_specs(self, seed: Dict[str, Dict], user: Dict[str, Dict]) -> Dict[str, Dict]:
-        merged = {name: dict(spec) for name, spec in seed.items()}
-        for canonical_name, spec in user.items():
-            existing = merged.get(canonical_name, {})
-            merged[canonical_name] = {
-                "type": spec.get("type", existing.get("type", "Entity")),
-                "aliases": spec.get("aliases", existing.get("aliases", [])),
-                "parents": spec.get("parents", existing.get("parents", [])),
-            }
-        return merged
-
     def _load_taxonomy(self) -> Dict[str, Dict]:
         if not self.enable_taxonomy_enrichment:
             return {}
 
-        seed_taxonomy = self._load_taxonomy_file(SEED_TAXONOMY_PATH)
-        user_taxonomy = self._load_taxonomy_file(USER_TAXONOMY_PATH)
-        return self._merge_taxonomy_specs(seed_taxonomy, user_taxonomy)
+        return self._load_taxonomy_file(SEED_TAXONOMY_PATH)
 
     def _build_taxonomy_aliases(self) -> Dict[str, str]:
         alias_map: Dict[str, str] = {}
