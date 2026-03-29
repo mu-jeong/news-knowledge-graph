@@ -55,6 +55,35 @@ def _prepare_search_context(article_results: List[Dict[str, Any]]) -> tuple[str,
     
     return "\n\n---\n\n".join(full_text), source_links
 
+def _prepare_graph_enriched_context(article_results: List[Dict[str, Any]]) -> tuple[str, dict]:
+    """
+    벡터 검색으로 찾은 기사 결과에 그래프 확장 정보를 덧붙여
+    generator가 읽기 쉬운 컨텍스트와 출처 매핑을 생성합니다.
+    """
+    enriched_results = []
+    for article in article_results:
+        mentions = article.get("mentions", [])
+        relations = article.get("relations", [])
+        text = article.get("text", "")
+
+        graph_lines = []
+        if mentions:
+            graph_lines.append("[Graph Mentions] " + ", ".join(mentions))
+        if relations:
+            graph_lines.append("[Graph Relations] " + " | ".join(relations))
+
+        if graph_lines:
+            enriched_text = "\n".join(graph_lines) + "\n\n" + text
+        else:
+            enriched_text = text
+
+        enriched_results.append({
+            "text": enriched_text,
+            "urls": article.get("urls", []),
+        })
+
+    return _prepare_search_context(enriched_results)
+
 def vector_retriever_node(state: AgentState) -> dict:
     question = state.get("question", "")
     current_keyword = state.get("current_keyword", "")
@@ -156,8 +185,6 @@ def text2cypher_retriever_node(state: AgentState) -> dict:
         return {"cypher_result": [], "search_context": f"Cypher 에러: {e}"}
 
 def vector_cypher_retriever_node(state: AgentState) -> dict:
-    # Entities to NewsArticles (Hybrid)
-    entities = state.get("extracted_entities", [])
     question = state.get("question", "")
     current_keyword = state.get("current_keyword", "")
     driver = get_neo4j_driver()
@@ -165,43 +192,44 @@ def vector_cypher_retriever_node(state: AgentState) -> dict:
         return {"search_context": "DB 연결 실패", "source_links": {}}
     if not current_keyword:
         return {"search_context": "현재 검색어 범위가 설정되지 않았습니다.", "source_links": {}}
-         
-    if not entities:
-        # Fallback to vector
-        return vector_retriever_node(state)
-        
-    try:
-        with driver.session() as session:
-            # entities가 1개일 때와 2개 이상일 때를 커버
-            if len(entities) >= 2:
-                # 2개 이상이면 교집합을 갖는 기사를 우선 검색
-                cypher = """
-                MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(a:NewsArticle)
-                MATCH (a)-[:MENTIONS]->(e1:Entity) WHERE e1.name CONTAINS $e1
-                MATCH (a)-[:MENTIONS]->(e2:Entity) WHERE e2.name CONTAINS $e2
-                WITH a
-                ORDER BY a.published_at DESC
-                RETURN a.text AS text, [a.id] AS urls LIMIT 5
-                """
-                params = {"e1": entities[0], "e2": entities[1], "current_keyword": current_keyword}
-            else:
-                cypher = """
-                MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(a:NewsArticle)
-                MATCH (a)-[:MENTIONS]->(e:Entity) WHERE e.name CONTAINS $e1
-                WITH a
-                ORDER BY a.published_at DESC
-                RETURN a.text AS text, [a.id] AS urls LIMIT 5
-                """
-                params = {"e1": entities[0], "current_keyword": current_keyword}
-                
-            result = session.run(cypher, **params)
-            article_results = [record.data() for record in result]
 
-            if not article_results:
-                # 관계망에 텍스트가 안 보이면 순수 Vector로 Fallback
+    try:
+        embedder = GoogleGenerativeAIEmbeddings(model=EMBEDDING_MODEL, google_api_key=os.getenv("GOOGLE_API_KEY"))
+        query_vector = embedder.embed_query(question)
+
+        with driver.session() as session:
+            # 1) 벡터 검색으로 현재 키워드 범위 안의 기사 후보를 먼저 회수
+            vector_result = session.run("""
+                MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(scoped:NewsArticle)
+                WITH collect(scoped.id) AS scoped_ids
+                CALL db.index.vector.queryNodes('article_embedding', 5, $query_vector)
+                YIELD node, score
+                WHERE node.id IN scoped_ids
+                RETURN node.id AS article_id, score
+                ORDER BY score DESC
+                LIMIT 5
+            """, query_vector=query_vector, current_keyword=current_keyword)
+
+            article_ids = [record["article_id"] for record in vector_result if record.get("article_id")]
+
+            if not article_ids:
                 return vector_retriever_node(state)
-            
-            search_context, source_links = _prepare_search_context(article_results)
+
+            # 2) 회수된 기사 주변의 엔티티/관계 정보를 Cypher로 확장
+            graph_result = session.run("""
+                UNWIND $article_ids AS article_id
+                MATCH (a:NewsArticle {id: article_id})
+                OPTIONAL MATCH (a)-[:MENTIONS]->(e:Entity)
+                WITH a, collect(DISTINCT e.name)[..8] AS mentions
+                OPTIONAL MATCH (a)-[:MENTIONS]->(s:Entity)-[r]->(t:Entity)<-[:MENTIONS]-(a)
+                WHERE type(r) <> 'MENTIONS'
+                WITH a, mentions, collect(DISTINCT s.name + ' -[' + type(r) + ']-> ' + t.name)[..8] AS relations
+                RETURN a.text AS text, [a.id] AS urls, mentions, relations
+            """, article_ids=article_ids)
+
+            article_results = [record.data() for record in graph_result]
+
+            search_context, source_links = _prepare_graph_enriched_context(article_results)
             return {"search_context": search_context, "source_links": source_links}
     except Exception as e:
         return {"search_context": f"Hybrid 검색 에러: {e}", "source_links": {}}

@@ -24,7 +24,7 @@
 
 - `Runtime Processing` 박스: 뉴스 기사에서 추출된 엔티티가 alias 규칙으로 먼저 정규화되고, seed taxonomy 또는 user taxonomy에 매칭되면 해당 canonical concept로 흡수됩니다.
 - `Fallback Entity` 노드: taxonomy에 없는 주제라도 바로 버리지 않고, 일반 엔티티로 유지해 그래프가 계속 동작하도록 하는 안전장치입니다.
-- `Later Ontology Expansion` 박스: fallback으로 남은 엔티티가 반복적으로 등장하면 후보 레지스트리에 누적되고, 이후 검토/승인을 거쳐 사용자 taxonomy로 편입될 수 있습니다.
+- `Later Ontology Expansion` 박스: fallback으로 남은 엔티티는 필요 시 후보 레지스트리에 누적할 수 있고, 이후 검토/승인을 거쳐 사용자 taxonomy로 편입될 수 있습니다. 이 후보 수집 기능은 설정으로 켜고 끌 수 있습니다.
 - 즉, 이 흐름도의 핵심은 "taxonomy가 없어도 서비스는 동작하고, 필요할 때만 구조를 확장한다"는 운영 원칙입니다.
 
 ---
@@ -64,7 +64,7 @@
   * LLM 모델명 (`LLM_MODEL`), 병렬 호출 수 (`LLM_MAX_WORKERS`), 배치 크기 (`BATCH_SIZE`)
   * semantic merge 사용 여부 (`ENABLE_ENTITY_SEMANTIC_MERGE`), semantic merge 임계값 (`ENTITY_SEMANTIC_MERGE_THRESHOLD`)
   * taxonomy 확장 사용 여부 (`ENABLE_TAXONOMY_ENRICHMENT`), seed taxonomy 경로 (`SEED_TAXONOMY_PATH`), 사용자 taxonomy 경로 (`USER_TAXONOMY_PATH`)
-  * ontology 후보 수집 여부 (`ENABLE_ONTOLOGY_CANDIDATE_CAPTURE`), 후보 레지스트리 경로 (`ONTOLOGY_CANDIDATE_REGISTRY_PATH`)
+  * ontology 후보 수집 여부 (`ENABLE_ONTOLOGY_CANDIDATE_CAPTURE`, 기본값 비활성화), 후보 레지스트리 경로 (`ONTOLOGY_CANDIDATE_REGISTRY_PATH`)
   * parent 추천 시작 기준 (`ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT`), 추천 최소 유사도 (`ONTOLOGY_PARENT_SUGGESTION_THRESHOLD`)
   * 페이지네이션 기준 (`DAYS_BACK_PER_PAGE`, `MAX_PAGES`)
   * 유사 기사 필터 (`MAX_ARTICLES_PER_DAY`, `SIMILARITY_THRESHOLD`)
@@ -72,7 +72,7 @@
 * **`entity_aliases.json`:** 엔티티 동의어 매핑 규칙을 코드 외부의 JSON 파일로 관리합니다. 코드 수정 없이 새로운 매핑을 추가할 수 있습니다.
 * **`entity_taxonomy.json`:** canonical 엔티티, 별칭, 상위 taxonomy 관계를 담는 공통 seed taxonomy입니다. 특정 산업/기업 중심이 아니라 여러 주제에서 재사용 가능한 공통 축만 유지합니다.
 * **`entity_taxonomy.user.json`:** 사용자가 자유롭게 확장하는 taxonomy 레이어입니다. 특정 주제의 상위 개념, 별칭, 부모 관계는 이 파일에서 추가/수정하는 것을 기본 전략으로 합니다.
-* **`data/ontology_candidates.json`:** taxonomy 미등록 엔티티 후보를 누적 기록하는 레지스트리입니다. 반복 출현 엔티티에 한해 parent 추천 후보를 저장합니다.
+* **`data/ontology_candidates.json`:** ontology 후보 수집 기능을 활성화했을 때 taxonomy 미등록 엔티티 후보를 누적 기록하는 선택적 레지스트리입니다.
 
 ### `src/core/crawlers/` (Layer 2: Data Crawlers)
 
@@ -91,7 +91,7 @@
   * alias 기반 정규화(`entity_aliases.json`)와 taxonomy 기반 canonical entity 확장(`entity_taxonomy.json`, `entity_taxonomy.user.json`)을 함께 수행합니다.
   * `GOOGLE_API_KEY`가 설정된 경우 선택적으로 임베딩 기반 semantic merge를 사용해 taxonomy canonical entity로 병합할 수 있습니다.
   * taxonomy에 없는 주제라도 엔티티를 제거하지 않고 fallback 노드로 유지합니다.
-  * taxonomy 미등록 엔티티는 `data/ontology_candidates.json`에 후보로 누적되며, 반복 출현 시에만 parent 후보를 제안합니다.
+  * taxonomy 미등록 엔티티는 기본적으로 fallback 노드로 유지됩니다. 필요 시 ontology 후보 수집 기능을 활성화하면 별도 레지스트리에 누적하고, 반복 출현 시 parent 후보를 제안할 수 있습니다.
   * 기사 기반 관계에는 `source_article`, `source_url`, `article_id`, `provenance=article`을 보존하고, taxonomy 관계에는 `provenance=taxonomy`를 기록합니다.
 
 ### `src/graphs/` (Layer 4: Graph Database & RAG)
@@ -111,7 +111,7 @@
 * **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다. 모든 리트리버는 검색된 기사(`NewsArticle`)의 본문 텍스트와 URL을 Neo4j에서 직접 가져와 `_prepare_search_context`를 통해 전역적으로 고유한 번호를 매기고 매핑 테이블을 생성합니다.
   * `vector_retriever_node`: `article_embedding` 벡터 인덱스를 사용해 기사 단위로 검색하고, `NewsArticle`의 URL을 함께 리턴합니다.
   * `text2cypher_retriever_node`: LLM이 자연어 → Cypher 변환 후 Neo4j 직접 쿼리. 관계형 추론이 필요한 질문에 유리합니다. → 반드시 `cypher_validator`를 거칩니다.
-  * `vector_cypher_retriever_node`: 엔티티 기반 Hybrid 검색. 특정 엔티티를 포함하는 기사와 관련 엔티티 컨텍스트를 결합하여 리턴합니다.
+  * `vector_cypher_retriever_node`: vector-first Hybrid 검색. 먼저 `article_embedding` 인덱스로 관련 기사를 찾고, 그 기사 주변의 `MENTIONS` 엔티티와 엔티티 관계를 Cypher로 확장하여 리턴합니다.
 * **`cypher_validator.py`:** (필수 보안 노드) `text2cypher_retriever`가 생성한 Cypher 쿼리를 실행 전에 2단계로 검증합니다.
   * **블랙리스트 검사:** `DELETE`, `DETACH`, `DROP`, `REMOVE`, `FOREACH`, `apoc.*` 등 파괴적/변조 명령어 즉시 차단
   * **Neo4j 문법 검사:** `EXPLAIN {query}`로 실제 데이터를 읽지 않고 서버에서 문법 사전 검증
@@ -148,7 +148,7 @@
 | `ENABLE_TAXONOMY_ENRICHMENT` | `True` | seed taxonomy와 user taxonomy를 함께 적용할지 여부 |
 | `SEED_TAXONOMY_PATH` | `src/configs/entity_taxonomy.json` | 공통 축을 담는 seed taxonomy 파일 경로 |
 | `USER_TAXONOMY_PATH` | `src/configs/entity_taxonomy.user.json` | 사용자 확장 taxonomy 파일 경로 |
-| `ENABLE_ONTOLOGY_CANDIDATE_CAPTURE` | `True` | taxonomy 미등록 엔티티 후보를 수집할지 여부 |
+| `ENABLE_ONTOLOGY_CANDIDATE_CAPTURE` | `False` | taxonomy 미등록 엔티티 후보를 수집할지 여부 |
 | `ONTOLOGY_CANDIDATE_REGISTRY_PATH` | `data/ontology_candidates.json` | ontology 후보 레지스트리 파일 경로 |
 | `ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT` | `3` | parent 후보 추천을 시작하는 최소 반복 출현 횟수 |
 | `ONTOLOGY_PARENT_SUGGESTION_THRESHOLD` | `0.78` | parent 후보 추천 시 사용하는 최소 유사도 |
