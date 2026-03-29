@@ -55,7 +55,7 @@
 *▲ "이란 전쟁으로 인해 영향을 받는 부분을 알려줘" 질문에 대한 답변. 각 문장마다 클릭 가능한 [출처] 링크가 붙어 있습니다.*
 
 ![Graph RAG 챗봇 – 지정학적 리스크 질의](examples/qna2.png)
-*▲ "삼성전자와 하이닉스가 공통적으로 겪고 있는 지정학적 리스크" 질문. `vector_cypher` 경로를 선택하여 그래프 관계 기반 답변을 생성합니다.*
+*▲ "삼성전자와 하이닉스가 공통적으로 겪고 있는 지정학적 리스크" 질문. `vector_cypher` 경로를 선택하여 먼저 관련 기사를 벡터 검색으로 찾고, 그 기사 주변의 그래프 정보를 확장해 답변을 생성합니다.*
 
 
 ## 🗺️ 지식 그래프 온톨로지
@@ -88,7 +88,7 @@
   - 관리형 관계 타입: `SUPPLIES_TO`, `COMPETES_WITH`, `BELONGS_TO`, `PART_OF`, `RELEASED`, `USES`, `EXPOSED_TO`, `BENEFITS_FROM`, `AFFECTS`, `OWNS`, `RELATED_TO`, `MENTIONS`
   - 엔티티 정규화는 `entity_aliases.json`의 별칭 규칙과 taxonomy 설정을 함께 사용합니다.
   - `entity_taxonomy.json`은 공통 seed taxonomy만 유지하고, 사용자가 자유롭게 확장할 내용은 `entity_taxonomy.user.json`에 추가합니다.
-  - 코드 레벨에서는 taxonomy가 없어도 동작하는 fallback을 유지하고, taxonomy 미등록 엔티티는 `data/ontology_candidates.json`에 후보로 누적합니다.
+  - 코드 레벨에서는 taxonomy가 없어도 동작하는 fallback을 유지합니다. ontology 후보 수집 기능은 설정으로 남아 있지만 현재 기본값은 비활성화되어 있습니다.
 - **[Layer 2] Data Crawlers (`src/core/crawlers/`)**:
   - 신뢰 언론사 화이트리스트(`chosun.com`, `yna.co.kr`, `hankyung.com` 등) 기사만 선별합니다.
   - TF-IDF + 코사인 유사도 기반으로 중복 기사를 제거하고, 개별 기사의 본문을 정제하여 `NewsArticle` 노드에 직접 저장합니다. (`naver_news.py`)
@@ -96,7 +96,7 @@
   - 수집 기간은 **달력 일(日) 기준**으로, 1일=오늘, 5일=오늘 포함 과거 5일. (최대 100일)
 - **[Layer 3] Data Processing (`src/core/utils/`)**:
   - 파편화된 엔티티를 `entity_aliases.json` 매핑 규칙으로 표준화하고, seed taxonomy 및 사용자 확장 taxonomy를 함께 반영합니다. (`entity_resolution.py`)
-  - taxonomy가 없는 새 주제도 fallback 엔티티로 자연스럽게 유지하고, 반복 출현 시에만 parent 추천 후보를 기록합니다.
+  - taxonomy가 없는 새 주제도 fallback 엔티티로 자연스럽게 유지합니다. 필요 시 ontology 후보 수집 기능을 켜서 반복 출현 개념을 별도 레지스트리에 기록할 수 있습니다.
 - **[Layer 4] Graph Database & RAG (`src/graphs/`, `src/nodes/`)**:
   - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 적용하여 **검색어별로 누적 적재**합니다.
   - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)

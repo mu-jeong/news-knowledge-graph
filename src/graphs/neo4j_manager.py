@@ -65,6 +65,22 @@ class Neo4jLoader:
                 except:
                     pass
         return {}
+
+    def get_keyword_article_dates(self, keyword: str) -> List[str]:
+        """키워드와 연결된 기사들의 발행 날짜(YYYY-MM-DD) 목록을 반환합니다."""
+        if not self.driver:
+            return []
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (:Keyword {name: $k})-[:HAS_ARTICLE]->(a:NewsArticle)
+                WHERE a.published_at IS NOT NULL
+                RETURN DISTINCT toString(date(a.published_at)) AS published_date
+                ORDER BY published_date
+                """,
+                k=keyword,
+            )
+            return [record["published_date"] for record in result if record.get("published_date")]
         
     def update_keyword_watermarks(self, keyword: str, new_wms: dict):
         """키워드 노드에 날짜별 마지막 수집 시각(watermarks)을 병합하여 업데이트합니다."""

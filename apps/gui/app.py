@@ -4,23 +4,42 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../.
 
 import json
 import collections
+import re
 import networkx as nx
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import streamlit as st
 from pyvis.network import Network
 import streamlit.components.v1 as components
 from dotenv import load_dotenv
+from src.ui.session_state import (
+    get_analysis_scope,
+    get_analysis_scope_signature,
+    set_analysis_scope,
+)
 from src.configs.settings import (
     LLM_MODEL, LLM_MAX_WORKERS, BATCH_SIZE,
-    DEFAULT_DAYS_BACK, GRAPH_QUERY_LIMIT, GRAPH_HOP_DEPTH,
-    PAGERANK_DEFAULT_TOP,
+    DEFAULT_DAYS_BACK, GRAPH_HOP_DEPTH,
 )
-
-from src.graphs.neo4j_manager import Neo4jLoader
 
 load_dotenv()
 
 st.set_page_config(layout="wide", page_title="News Graph Dashboard", page_icon="🕸️")
+
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 2.2rem;
+        padding-bottom: 2rem;
+    }
+    h2 {
+        margin-top: 0.4rem;
+        padding-top: 0;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 
@@ -42,19 +61,43 @@ def run_pipeline(keyword: str, days_back: int = 7):
     log.append(f"🔍 **[0/4] 증분 기준 조회 중...** `{keyword}`의 과거 날짜별 수집 이력(Watermarks)을 확인합니다.")
     yield "\n".join(log)
     watermarks = {}
+    article_dates = set()
+    effective_watermarks = {}
+    missing_dates = set()
     try:
         from datetime import datetime, timedelta
         _loader_check = Neo4jLoader()
         watermarks = _loader_check.get_keyword_watermarks(keyword)
+        get_article_dates = getattr(_loader_check, "get_keyword_article_dates", None)
+        article_dates = set(get_article_dates(keyword)) if callable(get_article_dates) else set()
         _loader_check.close()
-        
-        if watermarks:
-            log.append(f"  → 📅 DB에 기존 데이터가 확인되었습니다. 부분 수집된 날짜를 고려하여 신규 기사만 정밀 추출합니다.")
+
+        requested_start = (datetime.now() - timedelta(days=days_back - 1)).date()
+        requested_dates = {
+            (requested_start + timedelta(days=offset)).strftime("%Y-%m-%d")
+            for offset in range(days_back)
+        }
+        collected_dates = set(watermarks.keys()) | article_dates
+        missing_dates = requested_dates - collected_dates
+
+        if collected_dates:
+            if missing_dates:
+                effective_watermarks = {}
+                missing_preview = ", ".join(sorted(missing_dates)[:5])
+                more_suffix = " ..." if len(missing_dates) > 5 else ""
+                log.append("  → 📅 DB에 기존 데이터가 확인되었습니다. 요청 범위 안의 미수집 날짜만 보강 수집합니다.")
+                log.append(f"  → 보강 대상 날짜: {missing_preview}{more_suffix}")
+            else:
+                effective_watermarks = watermarks
+                log.append(f"  → 📅 DB에 기존 데이터가 확인되었습니다. 부분 수집된 날짜를 고려하여 신규 기사만 정밀 추출합니다.")
         else:
+            effective_watermarks = {}
             log.append(f"  → 🆕 처음 검색하는 키워드 — 요청하신 **최근 {days_back}일치 전체**를 수집합니다.")
         
     except Exception as _e:
         watermarks = {}
+        article_dates = set()
+        effective_watermarks = {}
         log.append(f"  → ⚠️ 수집 이력 조회 실패 (전체 수집 진행): {_e}")
 
     yield "\n".join(log)
@@ -65,7 +108,7 @@ def run_pipeline(keyword: str, days_back: int = 7):
     try:
         provider = NaverNewsProvider()
         # 1. API를 통해 해당 범위의 기사들을 일단 모두 가져옴 (fetch_data) - watermark 적용
-        raw_articles = provider.fetch_data(keyword=keyword, days_back=days_back, watermarks=watermarks)
+        raw_articles = provider.fetch_data(keyword=keyword, days_back=days_back, watermarks=effective_watermarks)
         article_metadata = provider.get_article_metadata(raw_articles)
         
         # ───────── 지능형 DB 필터링 (Gap-free Incremental) ──────────
@@ -80,9 +123,13 @@ def run_pipeline(keyword: str, days_back: int = 7):
         
         if not filtered_article_metadata:
             # 케이스 1: API에서 기사는 가져왔거나(all_urls), 워터마크에 의해 모두 필터링된 경우(watermarks)
-            if all_urls or watermarks:
-                log.append(f"  → ✨ **이미 최신 지식이 반영되어 있습니다.** (금일 요청 범위에서 새로 발행된 기사가 없습니다.)")
-                log.append("  💡 기존 그래프와 검색 컨텍스트를 그대로 사용합니다. 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
+            if all_urls or watermarks or article_dates:
+                if missing_dates:
+                    log.append("  → ✨ **요청 범위 안에서 DB에 없는 추가 날짜 기사를 찾지 못했습니다.**")
+                    log.append("  💡 기존 그래프와 검색 컨텍스트를 그대로 사용합니다. 더 넓은 기간을 시도하거나 다른 키워드를 확인해 보세요.")
+                else:
+                    log.append(f"  → ✨ **이미 최신 지식이 반영되어 있습니다.** (요청 범위에서 새로 발행된 기사가 없습니다.)")
+                    log.append("  💡 기존 그래프와 검색 컨텍스트를 그대로 사용합니다. 새로운 뉴스가 나올 때까지 기다리거나, 더 넓은 기간으로 검색해 보세요.")
                 log.append(f"\n🎉 **파이프라인 완료!** 기존 데이터를 기준으로 그래프를 표시합니다.")
                 yield "\n".join(log)
                 yield True
@@ -248,7 +295,8 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
                        type(r) AS edge_type,
                        rel_props['source_url'] AS source_url,
                        r.description AS description,
-                       COALESCE(rel_props['source_article'], CASE WHEN coalesce(rel_props['provenance'], '') = 'taxonomy' THEN 'taxonomy' ELSE '정보 없음' END) AS source_article
+                       COALESCE(rel_props['source_article'], CASE WHEN coalesce(rel_props['provenance'], '') = 'taxonomy' THEN 'taxonomy' ELSE '정보 없음' END) AS source_article,
+                       coalesce(rel_props['provenance'], 'article') AS provenance
                 
                 UNION
                 
@@ -258,7 +306,8 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
 {date_filter}                RETURN k.name AS source, 'Keyword' AS source_type,
                        a.id AS target, 'NewsArticle' AS target_type,
                        type(r) AS edge_type,
-                       '' AS source_url, '' AS description, a.title AS source_article
+                       '' AS source_url, '' AS description, a.title AS source_article,
+                       'keyword' AS provenance
             """
             records = [r.data() for r in session.run(query, **params)]
 
@@ -287,6 +336,25 @@ def fetch_graph_data(keyword: str = "", date_from=None, date_to=None):
         return [], {}
 
 
+def _format_display_date_range(date_from, date_to):
+    if date_from and date_to:
+        return f"{date_from:%Y-%m-%d} ~ {date_to:%Y-%m-%d}"
+    if date_from:
+        return f"{date_from:%Y-%m-%d} ~"
+    if date_to:
+        return f"~ {date_to:%Y-%m-%d}"
+    return "전체 기간"
+
+
+def _route_label(route: str) -> str:
+    return {
+        "vector": "벡터 기사 검색",
+        "text2cypher": "그래프 질의",
+        "vector_cypher": "하이브리드 검색",
+        "fallback": "기본 검색",
+    }.get(route or "", route or "알 수 없음")
+
+
 def get_connected(keyword, all_edges, max_hop=3):
     all_node_ids = {n for e in all_edges for n in (e["source"], e["target"])}
     if not keyword or keyword not in all_node_ids:
@@ -309,27 +377,150 @@ def get_connected(keyword, all_edges, max_hop=3):
     return set(visited.keys())
 
 
+def build_keyword_context_edges(keyword, nodes, centrality, node_types, top_k=5):
+    if not keyword or not nodes:
+        return []
+
+    candidate_nodes = [
+        node for node in nodes
+        if node != keyword and node_types.get(node) not in {"Keyword", "NewsArticle"}
+    ]
+    ranked_nodes = sorted(
+        candidate_nodes,
+        key=lambda node: (centrality.get(node, 0), node_types.get(node, ""), node),
+        reverse=True,
+    )[:top_k]
+    return [
+        {
+            "source": keyword,
+            "source_type": "Keyword",
+            "target": target,
+            "target_type": node_types.get(target, "Entity"),
+            "edge_type": "KEYWORD_CONTEXT",
+            "source_url": "",
+            "description": "현재 검색어와 직접 연결된 핵심 엔티티",
+            "source_article": "UI context",
+            "provenance": "ui",
+            "_virtual": True,
+        }
+        for target in ranked_nodes
+    ]
+
+
+def build_taxonomy_levels(edges):
+    taxonomy_edges = [
+        edge for edge in edges
+        if edge.get("provenance") == "taxonomy" and edge.get("source") and edge.get("target")
+    ]
+    if not taxonomy_edges:
+        return {}
+
+    children_by_parent = collections.defaultdict(list)
+    source_nodes = set()
+    target_nodes = set()
+    for edge in taxonomy_edges:
+        child = edge["source"]
+        parent = edge["target"]
+        children_by_parent[parent].append(child)
+        source_nodes.add(child)
+        target_nodes.add(parent)
+
+    roots = list(target_nodes - source_nodes) or list(target_nodes)
+    levels = {}
+    queue = collections.deque((root, 0) for root in roots)
+    while queue:
+        node, level = queue.popleft()
+        if node in levels and levels[node] <= level:
+            continue
+        levels[node] = level
+        for child in children_by_parent.get(node, []):
+            queue.append((child, level + 1))
+    return levels
+
+
+def build_node_details(nodes, edges, node_types, centrality):
+    details = {}
+    edge_types_by_node = collections.defaultdict(set)
+    article_titles_by_node = collections.defaultdict(set)
+    parents_by_node = collections.defaultdict(set)
+    children_by_node = collections.defaultdict(set)
+    neighbors_by_node = collections.defaultdict(set)
+
+    for edge in edges:
+        src = edge.get("source")
+        tgt = edge.get("target")
+        if not src or not tgt:
+            continue
+        edge_type = edge.get("edge_type", "")
+        provenance = edge.get("provenance", "")
+        neighbors_by_node[src].add(tgt)
+        neighbors_by_node[tgt].add(src)
+        edge_types_by_node[src].add(edge_type)
+        edge_types_by_node[tgt].add(edge_type)
+
+        if edge.get("source_article") and provenance == "article":
+            article_titles_by_node[src].add(edge["source_article"])
+            article_titles_by_node[tgt].add(edge["source_article"])
+        if provenance == "taxonomy":
+            parents_by_node[src].add(tgt)
+            children_by_node[tgt].add(src)
+
+    for node in sorted(nodes):
+        details[node] = {
+            "type": node_types.get(node, "Entity"),
+            "degree": centrality.get(node, 0),
+            "neighbors": sorted(neighbors_by_node.get(node, set())),
+            "edge_types": sorted(edge_types_by_node.get(node, set())),
+            "article_titles": sorted(article_titles_by_node.get(node, set()))[:5],
+            "parents": sorted(parents_by_node.get(node, set())),
+            "children": sorted(children_by_node.get(node, set())),
+        }
+    return details
+
+
+def build_node_label(node, node_type, detail, view_mode):
+    def _trim(text, limit=16):
+        return text if len(text) <= limit else f"{text[:limit-1]}…"
+
+    def _clean_title(title):
+        title = re.sub(r"\s+", " ", title).strip()
+        title = re.sub(r"^\[[^\]]+\]\s*", "", title)
+        return title
+
+    name_line = _trim(node, 18)
+    article_titles = detail.get("article_titles", [])
+
+    if view_mode == "계층 보기":
+        if node_type == "Keyword":
+            return name_line
+        if article_titles:
+            summary_line = _trim(_clean_title(article_titles[0]), 34)
+            return f"{name_line}\n{summary_line}"
+        if node_type:
+            return f"{name_line}\n{_trim(node_type, 16)}"
+        return name_line
+
+    return name_line
+
+
 # ─────────────────────────────
 # UI
 # ─────────────────────────────
-st.title("🌐 News Graph Dashboard")
-
-
 # ─────────────────────────────
 # 사이드바: 검색 + 파이프라인 실행
 # ─────────────────────────────
 with st.sidebar:
-    st.header("🔍 검색")
+    st.header("검색")
     search_input = st.text_input(
         "검색어",
-        placeholder="예: 삼성전자, SK하이닉스, NVIDIA",
+        placeholder="예: 삼성전자, 현대자동차, 셀트리온",
         label_visibility="collapsed",
     )
     days_input = st.number_input("수집 기간 (일)", min_value=1, max_value=100, value=DEFAULT_DAYS_BACK)
-    run_btn = st.button("🚀 검색 & 그래프 생성", type="primary", use_container_width=True)
+    run_btn = st.button("그래프 생성", type="primary", use_container_width=True)
 
     st.divider()
-    st.subheader("📅 기사 기간 필터")
+    st.subheader("기사 기간 필터")
     from datetime import date as _date, timedelta as _timedelta
     _today = _date.today()
     _default_from = _today - _timedelta(days=100)
@@ -348,7 +539,56 @@ with st.sidebar:
         view_date_from, view_date_to = None, None
 
     st.divider()
-    st.markdown("""
+    st.subheader("보기 설정")
+    if "view_mode" not in st.session_state:
+        st.session_state["view_mode"] = "네트워크 보기"
+    if "last_view_mode" not in st.session_state:
+        st.session_state["last_view_mode"] = st.session_state["view_mode"]
+    if "pagerank_top" not in st.session_state:
+        st.session_state["pagerank_top"] = 50
+
+    view_mode = st.radio(
+        "그래프 보기 방식",
+        options=["네트워크 보기", "계층 보기"],
+        horizontal=True,
+        key="view_mode",
+    )
+    if view_mode != st.session_state["last_view_mode"]:
+        if view_mode == "계층 보기":
+            st.session_state["pagerank_top"] = 100
+        else:
+            st.session_state["pagerank_top"] = 50
+    elif view_mode == "계층 보기":
+        st.session_state["pagerank_top"] = 100
+    st.session_state["last_view_mode"] = view_mode
+
+    keyword_context_count = st.slider("검색어 중심 연결 수", min_value=3, max_value=8, value=5, step=1)
+    pagerank_top = st.slider(
+        "PageRank 상위 (%)",
+        min_value=10, max_value=100, step=10,
+        help="PageRank 점수 기준 상위 N%의 노드만 표시합니다.",
+        key="pagerank_top",
+        disabled=view_mode == "계층 보기",
+    )
+    st.markdown("**관계 유형**")
+    _et_placeholder = st.empty()
+    st.markdown("**노드 유형**")
+    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "Technology", "MacroEvent", "RiskFactor", "NewsArticle", "Entity"]
+    # NewsArticle은 기본적으로 제외 (사용자 요청)
+    default_node_types = [t for t in all_node_type_options if t != "NewsArticle"]
+    selected_node_types = st.multiselect(
+        "node_type_filter",
+        options=all_node_type_options,
+        default=default_node_types,
+        label_visibility="collapsed",
+    )
+    show_taxonomy_edges = st.toggle("taxonomy 관계 표시", value=True, help="계층형 ontology 관계를 그래프에 표시합니다.")
+    emphasize_taxonomy = st.toggle("계층 구조 강조", value=True, help="taxonomy 관계를 더 진하고 굵게 강조합니다.")
+    show_edge_labels = st.toggle("엣지 라벨 표시", value=False, help="관계 라벨을 기본 그래프에 표시합니다.")
+
+    st.divider()
+    with st.expander("범례", expanded=False):
+        st.markdown("""
 **범례 (엔티티 구조별 색상)**
 
 **1. 뼈대 (메타데이터)**
@@ -369,31 +609,12 @@ with st.sidebar:
 ---
 **관계(엣지) 연결 형태**
 - **🔗 실선 (파란)**: 기사 출처가 명확함 — 클릭 시 원문 뉴스로 이동
-- **➖ 점선 (회색)**: 기사 출처 없음 / 일반 엔티티 간 구조적 관계
+- **➖ 점선 (회색/금색)**: taxonomy 관계 또는 UI 보조 연결
+- **🟣 점선**: 현재 검색어와 핵심 엔티티를 잇는 UI 전용 연결
 """)
 
     st.divider()
-    st.subheader("🔧 필터")
-    pagerank_top = st.slider(
-        "PageRank 상위 (%)",
-        min_value=10, max_value=100, value=PAGERANK_DEFAULT_TOP, step=10,
-        help="PageRank 점수 기준 상위 N%의 노드만 표시합니다."
-    )
-    st.markdown("**관계 유형** (검색 후 선택 가능)")
-    _et_placeholder = st.empty()
-    st.markdown("**노드 유형**")
-    all_node_type_options = ["Keyword", "Company", "Industry", "Product", "Technology", "MacroEvent", "RiskFactor", "NewsArticle", "Entity"]
-    # NewsArticle은 기본적으로 제외 (사용자 요청)
-    default_node_types = [t for t in all_node_type_options if t != "NewsArticle"]
-    selected_node_types = st.multiselect(
-        "node_type_filter",
-        options=all_node_type_options,
-        default=default_node_types,
-        label_visibility="collapsed",
-    )
-
-    st.divider()
-    if st.button("🗑️ 데이터베이스 초기화", use_container_width=True, help="Neo4j의 모든 데이터를 삭제하고 처음부터 다시 시작합니다."):
+    if st.button("데이터베이스 초기화", use_container_width=True, help="Neo4j의 모든 데이터를 삭제하고 처음부터 다시 시작합니다."):
         try:
             import importlib
             import src.graphs.neo4j_manager
@@ -403,21 +624,26 @@ with st.sidebar:
             if loader.driver:
                 loader.clear_database()  # 이전에 추가한 clear_database 메서드 호출
                 loader.close()
-                st.success("✅ DB가 초기화되었습니다. 이제 검색 시 전체 데이터를 수집합니다.")
+                st.success("데이터베이스를 초기화했습니다. 이제 다시 수집할 수 있습니다.")
                 st.rerun()
             else:
                 st.error("Neo4j 드라이버 연결에 실패했습니다.")
         except Exception as e:
             st.error(f"초기화 중 오류 발생: {e}")
 
+analysis_scope = get_analysis_scope()
+active_keyword = analysis_scope.get("keyword", "")
+active_date_from = analysis_scope.get("date_from")
+active_date_to = analysis_scope.get("date_to")
+
 # 파이프라인 실행
 if run_btn and search_input.strip():
     keyword = search_input.strip()
 
-    st.info(f"**'{keyword}'** 뉴스를 수집하고 그래프를 구축합니다.")
+    st.info(f"`{keyword}` 관련 뉴스를 수집하고 그래프를 구성합니다.")
     log_area = st.empty()
 
-    with st.spinner("파이프라인 실행 중..."):
+    with st.spinner("그래프를 생성하는 중입니다..."):
         pipeline_success = False
         for log_msg in run_pipeline(keyword, days_back=int(days_input)):
             if isinstance(log_msg, bool):
@@ -426,7 +652,8 @@ if run_btn and search_input.strip():
             log_area.markdown(log_msg)
 
     if pipeline_success:
-        st.success("✅ 완료! 그래프가 아래에 표시됩니다.")
+        set_analysis_scope(keyword, view_date_from, view_date_to)
+        st.success("그래프를 업데이트했습니다.")
         st.rerun()
 
 elif run_btn and not search_input.strip():
@@ -436,11 +663,11 @@ elif run_btn and not search_input.strip():
 # ─────────────────────────────
 # 메인 레이아웃: 수직 통합 배치 (위: 그래프, 아래: 채팅)
 # ─────────────────────────────
-st.header("🕸️ 지식 그래프")
+st.header("지식 그래프")
 records, centrality = fetch_graph_data(
-    keyword=search_input.strip() if search_input else "",
-    date_from=view_date_from,
-    date_to=view_date_to,
+    keyword=active_keyword,
+    date_from=active_date_from,
+    date_to=active_date_to,
 )
 
 if not records:
@@ -448,19 +675,21 @@ if not records:
     st.markdown(
         """
         <div style="text-align:center; padding: 60px 20px;">
-            <h2>🕸️ 아직 그래프 데이터가 없습니다</h2>
+            <h2>아직 그래프 데이터가 없습니다</h2>
             <p style="font-size:1.1rem; color:#888;">
                 왼쪽 사이드바에서 키워드를 입력하고<br>
-                <b>🚀 검색 &amp; 그래프 생성</b> 버튼을 눌러주세요.
+                <b>그래프 생성</b> 버튼을 눌러주세요.
             </p>
             <p style="font-size:0.9rem; color:#aaa;">
-                Neo4j가 실행 중인지, .env의 API 키가 올바른지 확인해주세요.
+                Neo4j 실행 여부와 환경 변수(.env) 설정을 확인해 주세요.
             </p>
         </div>
         """,
         unsafe_allow_html=True,
     )
     st.stop()
+
+scope_label = _format_display_date_range(active_date_from, active_date_to)
 
 all_edges = records
 node_types = {}
@@ -483,6 +712,9 @@ with st.sidebar:
 if selected_edge_types:
     all_edges = [e for e in all_edges if e.get("edge_type") in selected_edge_types]
 
+if not show_taxonomy_edges and view_mode != "계층 보기":
+    all_edges = [e for e in all_edges if e.get("provenance") != "taxonomy"]
+
 # ② 노드 타입 필터
 if selected_node_types:
     all_edges = [
@@ -492,38 +724,116 @@ if selected_node_types:
     ]
 
 # ③ PageRank 상위 N% 필터
-if all_edges and pagerank_top < 100:
+effective_pagerank_top = 100 if view_mode == "계층 보기" else pagerank_top
+if all_edges and effective_pagerank_top < 100:
     G = nx.DiGraph()
     for e in all_edges:
         # source나 target이 None이면 NetworkX에서 에러 발생하므로 스킵
         if e.get("source") and e.get("target"):
             G.add_edge(e["source"], e["target"])
     pr = nx.pagerank(G, alpha=0.85)
-    cutoff_count = max(1, int(len(pr) * pagerank_top / 100))
+    cutoff_count = max(1, int(len(pr) * effective_pagerank_top / 100))
     top_nodes = {n for n, _ in sorted(pr.items(), key=lambda x: -x[1])[:cutoff_count]}
     all_edges = [e for e in all_edges if e["source"] in top_nodes and e["target"] in top_nodes]
 
-# hop 필터
-filter_kw = search_input.strip() if search_input else ""
-connected = get_connected(filter_kw, all_edges, max_hop=GRAPH_HOP_DEPTH)
+# hop 필터 + 검색어 중심 UI 연결
+filter_kw = active_keyword
+if filter_kw:
+    node_types[filter_kw] = "Keyword"
+base_nodes = {n for e in all_edges for n in (e["source"], e["target"])}
+if filter_kw:
+    base_nodes.add(filter_kw)
+virtual_keyword_edges = (
+    build_keyword_context_edges(filter_kw, base_nodes, centrality, node_types, top_k=keyword_context_count)
+    if filter_kw else []
+)
+
+connected = get_connected(filter_kw, all_edges + virtual_keyword_edges, max_hop=GRAPH_HOP_DEPTH)
 
 if connected:
     edges = [e for e in all_edges if e["source"] in connected and e["target"] in connected]
+    edges.extend([e for e in virtual_keyword_edges if e["source"] in connected and e["target"] in connected])
     nodes = connected
 else:
-    edges = all_edges
-    nodes = {n for e in all_edges for n in (e["source"], e["target"])}
+    edges = list(all_edges) + virtual_keyword_edges
+    nodes = {n for e in edges for n in (e["source"], e["target"])}
+
+taxonomy_levels = build_taxonomy_levels(edges)
+node_details = build_node_details(nodes, edges, node_types, centrality)
+taxonomy_nodes = {n for e in edges if e.get("provenance") == "taxonomy" for n in (e["source"], e["target"])}
+hierarchy_keyword_edges = (
+    build_keyword_context_edges(
+        filter_kw,
+        taxonomy_nodes,
+        centrality,
+        node_types,
+        top_k=min(keyword_context_count, len(taxonomy_nodes)),
+    )
+    if filter_kw and taxonomy_nodes else []
+)
+
+if view_mode == "계층 보기":
+    render_edges = [e for e in edges if e.get("provenance") == "taxonomy"] + hierarchy_keyword_edges
+    render_nodes = {n for e in render_edges for n in (e["source"], e["target"])}
+else:
+    render_edges = edges
+    render_nodes = nodes
+
+if not render_nodes:
+    st.warning("현재 필터 조건에서 표시할 노드가 없습니다. 필터를 조금 완화해 보세요.")
+    st.stop()
 
 with st.sidebar:
-    st.caption(f"필터 후: **{len(nodes)}**개 노드 · **{len(edges)}**개 관계")
+    st.caption(f"필터 후: **{len(render_nodes)}**개 노드 · **{len(render_edges)}**개 관계")
 
-
-st.caption("파란색 엣지를 클릭하면 연결된 기사 원문으로 이동합니다.")
+if view_mode == "계층 보기":
+    st.caption("계층 보기에서는 taxonomy 관계와 검색어 중심 보조 연결만 표시합니다. 상위 개념은 위쪽, 하위 개념은 아래쪽에 배치됩니다.")
+else:
+    st.caption("실선은 기사 기반 관계이고, 점선은 taxonomy 또는 검색어 중심 UI 보조 연결입니다. 기사 기반 엣지를 클릭하면 원문으로 이동합니다.")
 
 net = Network(height="600px", width="100%", bgcolor="#1a1a2e",
               font_color="white", directed=True)
 net.barnes_hut(gravity=-5000, central_gravity=0.3, spring_length=200,
                spring_strength=0.01, damping=0.09, overlap=0)
+if view_mode == "계층 보기":
+    net.set_options("""
+    var options = {
+      "layout": {
+        "hierarchical": {
+          "enabled": true,
+          "direction": "UD",
+          "sortMethod": "directed",
+          "nodeSpacing": 260,
+          "levelSeparation": 220,
+          "treeSpacing": 320,
+          "blockShifting": true,
+          "edgeMinimization": true,
+          "parentCentralization": true
+        }
+      },
+      "physics": {
+        "enabled": false
+      }
+    }
+    """)
+elif emphasize_taxonomy:
+    net.set_options("""
+    var options = {
+      "layout": {
+        "improvedLayout": true
+      },
+      "physics": {
+        "solver": "barnesHut",
+        "barnesHut": {
+          "gravitationalConstant": -5000,
+          "centralGravity": 0.3,
+          "springLength": 200,
+          "springConstant": 0.01,
+          "damping": 0.09
+        }
+      }
+    }
+    """)
 
 # 노드 색상 맵 (엔티티 계층 구조 기반 테마 적용)
 color_map = {
@@ -550,34 +860,66 @@ def _font_color_for(bg_hex: str) -> str:
 
 import math as _math
 
-for node in nodes:
+for node in render_nodes:
     degree = centrality.get(node, 1)
     # 로그 스케일: 연결 수가 많아도 크기가 적절히 제한됨 (20~48px)
     size = 20 + _math.log1p(degree) * 9
     size = min(size, 48)
-    color = color_map.get(node_types.get(node), "#7F8C8D")
+    node_type = node_types.get(node)
+    color = color_map.get(node_type, "#7F8C8D")
     font_color = _font_color_for(color)
-    border_color = "#FFFFFF"
     border_width = 2
+    detail = node_details.get(node, {})
+    label = build_node_label(node, node_type, detail, view_mode)
     if node == filter_kw:
         color = "#8E44AD"  # 검색 키워드(Keyword) 지정 보라색
         size = max(size, 40)
         font_color = "#FFFFFF"
+        border_width = 4
+        if view_mode == "계층 보기":
+            node_margin = {"top": 14, "right": 18, "bottom": 14, "left": 18}
+            node_kwargs = {
+                "level": 0,
+                "widthConstraint": {"minimum": 120},
+            }
+        else:
+            node_margin = None
+            node_kwargs = {
+                "x": 0,
+                "y": 0,
+                "physics": False,
+            "fixed": {"x": True, "y": True},
+            }
+    else:
+        node_margin = {"top": 10, "right": 12, "bottom": 10, "left": 12} if view_mode == "계층 보기" else None
+        node_kwargs = {}
+        if node in taxonomy_levels and (emphasize_taxonomy or view_mode == "계층 보기"):
+            node_kwargs["level"] = taxonomy_levels[node] + 1
     net.add_node(
-        node, label=node,
-        title=f"🔵 {node}\n유형: {node_types.get(node, '?')} | 연결 수: {degree}",
+        node,
+        label=label,
+        title=(
+            f"{node}\n"
+            f"대표 기사: {detail.get('article_titles', ['없음'])[0] if detail.get('article_titles') else '없음'}\n"
+            f"유형: {node_type or '?'} | 연결 수: {degree}\n"
+            f"부모 개념: {', '.join(detail.get('parents', [])[:3]) or '없음'}\n"
+            f"하위 개념: {', '.join(detail.get('children', [])[:3]) or '없음'}"
+        ),
+        shape="box" if view_mode == "계층 보기" else "dot",
+        margin=node_margin,
         color={"background": color, "border": "#FFFFFF",
                "highlight": {"background": "#FFD700", "border": "#FFA500"}},
-        borderWidth=2,
+        borderWidth=border_width,
         size=size,
-        font={"size": 13, "color": font_color, "bold": True,
+        font={"size": 18 if (view_mode == "계층 보기" and node == filter_kw) else (10 if view_mode == "계층 보기" else (15 if node == filter_kw else 13)), "color": font_color, "bold": True,
               "strokeWidth": 3, "strokeColor": "#000000"},
+        **node_kwargs,
     )
 
 edge_url_map = {}
 pair_counter = collections.defaultdict(int)
 
-for i, rec in enumerate(edges):
+for i, rec in enumerate(render_edges):
     src, tgt = rec["source"], rec["target"]
     edge_id = f"e_{i}"  # 고유 ID 부여
     
@@ -593,17 +935,33 @@ for i, rec in enumerate(edges):
         tooltip += f"\n{rec['description']}"
     if rec.get("source_article"):
         tooltip += f"\n📰 {rec['source_article']}"
-    
+
+    provenance = rec.get("provenance", "")
+    is_virtual = bool(rec.get("_virtual"))
     has_url = bool(rec.get("source_url"))
     if has_url:
         edge_url_map[edge_id] = rec["source_url"]
         tooltip += "\n🔗 클릭하여 원문 보기"
+    if provenance == "taxonomy":
+        tooltip += "\n🟨 taxonomy 관계"
+    elif is_virtual:
+        tooltip += "\n🟣 검색어 중심 UI 보조 연결"
 
     edge_label = rec["edge_type"].lower().replace("_", " ")
-    display_label = f"🔗 {edge_label}" if has_url else edge_label
+    display_label = edge_label if show_edge_labels else ""
 
-    edge_color = "#5DADE2" if has_url else "#95A5A6"
-    edge_width = 2 if has_url else 1
+    if is_virtual:
+        edge_color = "#C792EA"
+        edge_width = 3
+        edge_dash = [3, 6]
+    elif provenance == "taxonomy":
+        edge_color = "#F4D35E" if emphasize_taxonomy else "#95A5A6"
+        edge_width = 3 if emphasize_taxonomy else 1
+        edge_dash = [6, 8]
+    else:
+        edge_color = "#5DADE2" if has_url else "#95A5A6"
+        edge_width = 2 if has_url else 1
+        edge_dash = False if has_url else [6, 6]
     
     net.add_edge(
         src, tgt,
@@ -612,7 +970,7 @@ for i, rec in enumerate(edges):
         title=tooltip,
         color={"color": edge_color, "highlight": "#FFD700"},
         width=edge_width,
-        dashes=False if has_url else [6, 6],
+        dashes=edge_dash,
         arrows={"to": {"enabled": True, "scaleFactor": 0.6}},
         smooth={"type": "curvedCW", "roundness": roundness},
         font={"size": 9, "color": edge_color,
@@ -659,7 +1017,64 @@ except Exception as e:
 # Agentic Chat (Graph RAG) 구현
 # ─────────────────────────────
 st.divider()
-st.header("🔍 지식 그래프 기반 검색")
+st.header("기간별 주요 뉴스 요약")
+st.caption(f"화면 표시 기준 기간: {scope_label}")
+
+from src.graphs.news_summary import summary_app
+from datetime import datetime as _summary_dt, time as _summary_time
+
+if "keyword_news_summary" not in st.session_state:
+    st.session_state.keyword_news_summary = ""
+if "keyword_news_summary_period" not in st.session_state:
+    st.session_state.keyword_news_summary_period = ""
+if "keyword_news_summary_scope" not in st.session_state:
+    st.session_state.keyword_news_summary_scope = ""
+
+summary_scope = get_analysis_scope_signature()
+if st.session_state.keyword_news_summary_scope != summary_scope:
+    st.session_state.keyword_news_summary = ""
+    st.session_state.keyword_news_summary_period = ""
+    st.session_state.keyword_news_summary_scope = summary_scope
+
+def _generate_news_summary():
+    if not filter_kw:
+        return {
+            "summary": "먼저 검색어를 입력하고 그래프를 생성해 주세요.",
+            "summary_period": "",
+        }
+
+    date_from_iso = _summary_dt.combine(active_date_from, _summary_time.min).isoformat() if active_date_from else None
+    date_to_iso = _summary_dt.combine(active_date_to, _summary_time.max).isoformat() if active_date_to else None
+    result = summary_app.invoke({
+        "current_keyword": filter_kw,
+        "date_from": date_from_iso,
+        "date_to": date_to_iso,
+    })
+    return {
+        "summary": result.get("summary", "요약을 생성하지 못했습니다."),
+        "summary_period": result.get("summary_period", ""),
+    }
+
+summary_btn = st.button("주요 뉴스 요약 다시 생성", use_container_width=True)
+
+should_generate_summary = bool(filter_kw) and (not st.session_state.keyword_news_summary or summary_btn)
+if should_generate_summary:
+    with st.spinner("현재 기간의 주요 뉴스를 요약하는 중입니다..."):
+        try:
+            summary_result = _generate_news_summary()
+            st.session_state.keyword_news_summary = summary_result.get("summary", "")
+            st.session_state.keyword_news_summary_period = summary_result.get("summary_period", "")
+        except Exception as e:
+            st.session_state.keyword_news_summary = f"주요 뉴스 요약 중 오류가 발생했습니다: {e}"
+            st.session_state.keyword_news_summary_period = ""
+
+if st.session_state.keyword_news_summary:
+    if st.session_state.keyword_news_summary_period:
+        st.caption(f"실제 요약 기사 기간: {st.session_state.keyword_news_summary_period}")
+    st.markdown(st.session_state.keyword_news_summary, unsafe_allow_html=True)
+
+st.divider()
+st.header("지식 그래프 질의응답")
 
 import uuid
 from src.graphs.hybrid_rag import rag_app
@@ -669,39 +1084,55 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
-if "chat_scope_keyword" not in st.session_state:
-    st.session_state.chat_scope_keyword = ""
+if "chat_scope_signature" not in st.session_state:
+    st.session_state.chat_scope_signature = ""
+if "chat_preset_prompt" not in st.session_state:
+    st.session_state.chat_preset_prompt = ""
+
+st.caption("투자자 관점에서 바로 물어볼 수 있는 질문을 준비했습니다.")
+quick_prompt_cols = st.columns(4)
+quick_prompts = [
+    "최근 핵심 투자 포인트 3가지만 정리해줘",
+    "이 종목에 연결된 리스크 요인을 우선순위로 보여줘",
+    "가장 많이 연결된 기업·산업·기술을 정리해줘",
+    "최근 기사 기준으로 긍정 촉매와 부정 촉매를 나눠줘",
+]
+for idx, quick_prompt in enumerate(quick_prompts):
+    if quick_prompt_cols[idx].button(quick_prompt, use_container_width=True):
+        st.session_state.chat_preset_prompt = quick_prompt
 
 # 1. 검색창을 상단에 배치 (고정된 느낌을 주기 위해 container 사용)
 input_container = st.container()
 with input_container:
-    prompt = st.chat_input("수집된 데이터에 대해 질문해보세요. (예: 삼성전자 협력사는 어디야?, HBM 전망은?)")
+    prompt = st.chat_input("현재 그래프를 기준으로 질문해보세요. 예: 협력사는 어디야?, 어떤 기술이 연결돼 있어?")
     
 chat_container = st.container()
+active_prompt = st.session_state.chat_preset_prompt or prompt
 
 # 입력 및 응답 생성 로직
-if prompt:
-    active_keyword = search_input.strip() if search_input else ""
+if active_prompt:
     if not active_keyword:
-        st.warning("질문 전에 먼저 검색어를 입력하고 그래프를 생성해 주세요.")
+        st.warning("먼저 검색어를 입력하고 그래프를 생성해 주세요.")
         st.stop()
 
-    if st.session_state.chat_scope_keyword != active_keyword:
+    current_scope_signature = get_analysis_scope_signature()
+    if st.session_state.chat_scope_signature != current_scope_signature:
         st.session_state.messages = []
         st.session_state.thread_id = str(uuid.uuid4())
-        st.session_state.chat_scope_keyword = active_keyword
+        st.session_state.chat_scope_signature = current_scope_signature
 
     # 사용자 메시지 추가 (메시지 리스트의 맨 뒤에 추가하지만 출력은 역순으로 함)
-    st.session_state.messages.append({"role": "user", "content": prompt})
+    st.session_state.messages.append({"role": "user", "content": active_prompt})
+    st.session_state.chat_preset_prompt = ""
     
     # 즉시 답변 생성 시각화 (spinner)
     with chat_container:
         with st.chat_message("assistant"):
-            with st.spinner("AI가 최적의 검색 경로를 찾고 있습니다... 🔍"):
+            with st.spinner("그래프를 바탕으로 답변을 찾는 중입니다..."):
                 config = {"configurable": {"thread_id": st.session_state.thread_id}}
                 try:
                     result = rag_app.invoke({
-                        "question": prompt,
+                        "question": active_prompt,
                         "current_keyword": active_keyword,
                         "retry_count": 0,
                         "final_answer": None
@@ -713,18 +1144,19 @@ if prompt:
                         answer = final_answer
                         route = result.get("route", "text2cypher")
                     else:
-                        answer = result.get("generation", "응답 생성 실패")
+                        answer = result.get("generation", "답변을 생성하지 못했습니다.")
                         route = result.get("route", "fallback")
                     
                     # 세션에 저장 (최신 답변을 위해 메시지 리스트에 추가)
                     st.session_state.messages.append({
                         "role": "assistant", 
                         "content": answer,
-                        "route": route
+                        "route": route,
+                        "source_count": len(result.get("source_links", {}) or {}),
                     })
-                    st.rerun() # 전체 다시 그려서 최신 것이 위로 가게 함
+                    st.rerun()
                 except Exception as e:
-                    st.error(f"실행 중 오류: {e}")
+                    st.error(f"질의응답 중 오류가 발생했습니다: {e}")
 
 # 2. 대화 세트 구성 (질문-답변 쌍을 한 묶음으로 처리)
 chat_sets = []
@@ -746,4 +1178,6 @@ with chat_container:
             with st.chat_message(msg["role"]):
                 st.markdown(msg["content"], unsafe_allow_html=True)
                 if msg.get("route"):
-                    st.caption(f"🛣️ 검색 경로 판단: `{msg['route']}`")
+                    source_count = msg.get("source_count")
+                    source_label = f" · 출처 기사 {source_count}건" if source_count is not None else ""
+                    st.caption(f"검색 경로: {_route_label(msg['route'])}{source_label}")
