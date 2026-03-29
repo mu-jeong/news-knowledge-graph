@@ -41,7 +41,7 @@
 
 시스템은 유지보수성과 확장성을 보장하기 위해 각 역할이 명확히 분리된 **디커플링(Decoupling)** 아키텍처를 따르고 있습니다. 전반적인 데이터 흐름은 다음과 같습니다.
 
-1. **Data Ingestion (크롤링):** 신뢰 언론사(화이트리스트) 기사만 선별 수집합니다. 수집 기간은 달력 일(日) 기준으로, 1일이면 '오늘', 5일이면 '오늘 포함 과거 5일'입니다. (최대 100일)
+1. **Data Ingestion (크롤링):** 신뢰 언론사(화이트리스트) 기사만 선별 수집합니다. 수집 기간은 달력 일(日) 기준으로, 1일이면 '오늘', 5일이면 '오늘 포함 과거 5일'입니다. (최대 100일) 다만 `days_back`은 요청 범위이지 기사 확보를 보장하는 값은 아닙니다. 네이버 뉴스 Search API가 최신순 결과를 실질적으로 최대 1,000건까지만 제공하므로, 기사량이 많은 키워드는 긴 기간을 요청해도 실제 수집 데이터가 최근 며칠치에 집중될 수 있습니다.
 2. **Watermark 기반 증분 처리:** 각 키워드별로 날짜별 마지막 수집 시각(Watermark)을 Neo4j에 저장합니다. 재검색 시 이미 수집 완료된 날짜는 건너뛰고, 부분 수집된 날짜(당일 등)는 해당 시각 이후 기사만 신규 수집합니다.
 3. **Deduplication & Filtering:** TF-IDF + 코사인 유사도 기반으로 날짜별 유사 기사를 제거하고, 하루 최대 기사 수를 초과 시 균등 샘플링합니다.
 4. **Article-level Embedding:** 각 기사를 독립적인 단위로 벡터 임베딩하여 `NewsArticle` 노드에 저장합니다. 이를 통해 기사 단위의 정밀한 벡터 검색이 가능합니다.
@@ -80,7 +80,10 @@
 * **`naver_news.py`:** 네이버 뉴스 API 구현체입니다. 주요 기능은 다음과 같습니다.
   * `ALLOWED_NEWS_DOMAINS`: 수집 허용 언론사 도메인 화이트리스트 (`chosun.com`, `yna.co.kr`, `hankyung.com` 등).
   * **달력 일(日) 기반 수집 범위:** `days_back=1`이면 오늘 0시부터, `days_back=5`이면 4일 전(오늘 포함 5일) 0시부터 수집을 시작합니다. 최대 100일까지 설정 가능합니다.
+  * **수집 전략 선택:** `recent`는 `days_back / DAYS_BACK_PER_PAGE` 기반으로 필요한 페이지만 추정해서 빠르게 조회하고, `coverage`는 네이버 API 허용 한도(`NAVER_NEWS_API_MAX_PAGES`, 현재 10페이지)까지 조회해 요청 시작일 도달 가능성을 최대화합니다.
+  * **기간 보장 한계:** 현재 구조는 "최신순 검색 결과를 페이지네이션으로 가능한 만큼 가져온 뒤, 그 안에서 `days_back` 범위만 남기는 방식"입니다. 즉 `days_back=30`은 30일치 기사 보장이 아니라 30일 범위 필터이며, 최신 기사 쏠림이 심한 키워드에서는 API 상한에 먼저 걸릴 수 있습니다.
   * **워터마크 기반 증분 처리:** 애플리케이션(`app.py`)에서 이미 수집된 날짜의 정확한 시각이 전달되면, 그 시각 이후에 발행된 기사만 신규 수집합니다.
+  * **커버리지 진단 로그:** 수집 후 `last_fetch_stats`에 `oldest_seen_date`, `requested_start_date`, `coverage_complete`, `hit_api_page_limit`를 남겨, "요청 기간 전체를 실제로 내려갔는지"를 UI에서 즉시 알 수 있습니다.
   * `filter_similar_articles()`: 날짜별로 기사를 묶고, 제목 TF-IDF 코사인 유사도 ≥ `SIMILARITY_THRESHOLD`(기본 0.5)인 기사를 중복으로 판별합니다. 중복 제거 후에도 하루 `MAX_ARTICLES_PER_DAY`(기본 100건) 초과 시 균등 샘플링합니다.
   * `cluster_data(batch_size=10)`: 허용 도메인 기사만 포함하고 영문 기사를 제외한 후, 10개씩 묶어 하나의 텍스트 배치(Batch)로 병합합니다. 각 기사에는 `[Article_1]`~`[Article_N]` 형태의 고유 ID를 부여하여 LLM이 출처를 명확히 추적할 수 있도록 합니다.
   * `get_article_metadata()`: URL / 제목 / 발행일 메타데이터를 추출하여 Neo4j `NewsArticle` 노드 저장에 활용합니다.
@@ -124,6 +127,8 @@
 ### `apps/gui/` (Layer 5: User Interface & Analytics)
 
 * **`app.py`:** Streamlit과 Pyvis를 활용하여 구축된 대화형 그래프 시각화 대시보드입니다.
+  * **수집 전략 UI:** 기본값은 `coverage`이며, 사용자는 `빠른 수집(recent)`과 `범위 우선 수집(coverage)` 중 하나를 선택할 수 있습니다.
+  * **미도달 경고:** `coverage` 전략에서도 API 페이지 상한 때문에 요청 시작일까지 내려가지 못하면, UI 로그에 "실제 API 조회 최하단 날짜"와 함께 범위 미충족 경고를 표시합니다.
   * **레이아웃:** 상단에 지식 그래프, 하단에 Graph RAG 채팅창을 수직 배치합니다.
   * **증분 파이프라인:** `[0/4] 워터마크 조회 → [1/4] 신규 기사 수집 → [2/4] LLM 추출 → [3/4] 정규화 → [4/4] 누적 적재`
   * **달력 일(日) 기반 수집:** 1일=오늘, 5일=오늘 포함 과거 5일 기준으로 직관적으로 수집 범위를 설정합니다. (최대 100일)
@@ -153,8 +158,10 @@
 | `ONTOLOGY_PARENT_SUGGESTION_MIN_COUNT` | `3` | parent 후보 추천을 시작하는 최소 반복 출현 횟수 |
 | `ONTOLOGY_PARENT_SUGGESTION_THRESHOLD` | `0.78` | parent 후보 추천 시 사용하는 최소 유사도 |
 | `DEFAULT_DAYS_BACK` | `1` | UI 기본 수집 기간(일) |
+| `DEFAULT_COLLECTION_STRATEGY` | `coverage` | UI 기본 수집 전략. 긴 기간 요청 시 범위 도달 가능성을 우선 확보 |
 | `DAYS_BACK_PER_PAGE` | `3` | 페이지당 기준 일수 (3일=1페이지=100건) |
-| `MAX_PAGES` | `10` | 최대 수집 페이지 (상한 1,000건) |
+| `MAX_PAGES` | `1000` | 내부 최대 요청 페이지 설정값. 실제 호출은 API 한도와 전략에 따라 추가 제한됨 |
+| `NAVER_NEWS_API_MAX_PAGES` | `10` | 네이버 뉴스 Search API 실질 상한. `start` 기반 최신순 조회는 최대 1,000건 |
 | `MAX_ARTICLES_PER_DAY` | `100` | 날짜별 최대 기사 수 (유사 필터 후) |
 | `SIMILARITY_THRESHOLD` | `0.5` | 제목 TF-IDF 코사인 유사도 임계값 |
 | `GRAPH_QUERY_LIMIT` | `500` | Neo4j 조회 최대 엣지 수 |

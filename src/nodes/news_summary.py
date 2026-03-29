@@ -67,6 +67,71 @@ def _format_actual_period(article_rows: List[Dict]) -> str:
     return f"{start_date:%Y-%m-%d} ~ {end_date:%Y-%m-%d}"
 
 
+def _extract_article_date(article: Dict):
+    published_at = article.get("published_at")
+    if not published_at:
+        return None
+    if hasattr(published_at, "to_native"):
+        try:
+            published_at = published_at.to_native()
+        except Exception:
+            pass
+    if isinstance(published_at, datetime):
+        return published_at.date()
+    if hasattr(published_at, "date"):
+        try:
+            return published_at.date()
+        except Exception:
+            pass
+    try:
+        normalized = re.sub(r"(\.\d{6})\d+(?=[+-])", r"\1", str(published_at))
+        return datetime.fromisoformat(normalized).date()
+    except ValueError:
+        return None
+
+
+def _balance_articles_by_date(article_rows: List[Dict], limit: int = 15, per_day_limit: int = 3) -> List[Dict]:
+    if not article_rows:
+        return []
+
+    balanced: List[Dict] = []
+    per_day_counts: Dict[str, int] = {}
+
+    for article in sorted(
+        article_rows,
+        key=lambda row: (
+            -float(row.get("score", 0) or 0),
+            str(row.get("published_at", "")),
+        ),
+    ):
+        article_date = _extract_article_date(article)
+        date_key = article_date.isoformat() if article_date else "unknown"
+        if per_day_counts.get(date_key, 0) >= per_day_limit:
+            continue
+        balanced.append(article)
+        per_day_counts[date_key] = per_day_counts.get(date_key, 0) + 1
+        if len(balanced) >= limit:
+            return balanced
+
+    selected_urls = {article.get("url") for article in balanced}
+    for article in sorted(
+        article_rows,
+        key=lambda row: (
+            str(row.get("published_at", "")),
+            -float(row.get("score", 0) or 0),
+        ),
+        reverse=True,
+    ):
+        if article.get("url") in selected_urls:
+            continue
+        balanced.append(article)
+        selected_urls.add(article.get("url"))
+        if len(balanced) >= limit:
+            break
+
+    return balanced
+
+
 def summary_retriever_node(state: dict) -> dict:
     current_keyword = state.get("current_keyword", "")
     date_from, date_to = _coerce_date_bounds(state.get("date_from"), state.get("date_to"))
@@ -96,7 +161,7 @@ def summary_retriever_node(state: dict) -> dict:
     MATCH (k:Keyword {{name: $current_keyword}})-[:HAS_ARTICLE]->(scoped:NewsArticle)
     WHERE 1=1 {article_date_filter}
     WITH collect(scoped.id) AS scoped_ids
-    CALL db.index.vector.queryNodes('article_embedding', 10, $query_vector)
+    CALL db.index.vector.queryNodes('article_embedding', 60, $query_vector)
     YIELD node, score
     WHERE node.id IN scoped_ids
     RETURN node.id AS url,
@@ -105,7 +170,7 @@ def summary_retriever_node(state: dict) -> dict:
            node.published_at AS published_at,
            score
     ORDER BY score DESC
-    LIMIT 6
+    LIMIT 40
     """
 
     entity_query = f"""
@@ -119,10 +184,18 @@ def summary_retriever_node(state: dict) -> dict:
     LIMIT 8
     """
 
+    period_query = f"""
+    MATCH (k:Keyword {{name: $current_keyword}})-[:HAS_ARTICLE]->(a:NewsArticle)
+    WHERE 1=1 {entity_date_filter}
+    RETURN a.published_at AS published_at
+    ORDER BY a.published_at ASC
+    """
+
     try:
         with driver.session() as session:
             article_rows = [record.data() for record in session.run(article_query, **article_params)]
             entity_rows = [record.data() for record in session.run(entity_query, **entity_params)]
+            scoped_period_rows = [record.data() for record in session.run(period_query, **entity_params)]
     except Exception as e:
         return {"summary_context": f"요약용 기사 조회 중 오류가 발생했습니다: {e}", "source_links": {}}
     finally:
@@ -130,6 +203,8 @@ def summary_retriever_node(state: dict) -> dict:
 
     if not article_rows:
         return {"summary_context": "현재 기간에 요약할 기사가 없습니다.", "source_links": {}}
+
+    article_rows = _balance_articles_by_date(article_rows, limit=15, per_day_limit=3)
 
     source_links: Dict[str, str] = {}
     article_blocks: List[str] = []
@@ -148,7 +223,7 @@ def summary_retriever_node(state: dict) -> dict:
         for row in entity_rows
     ]
 
-    period_text = _format_actual_period(article_rows)
+    period_text = _format_actual_period(scoped_period_rows or article_rows)
 
     summary_context = (
         f"[요약 대상]\n키워드: {current_keyword}\n기간: {period_text}\n\n"
