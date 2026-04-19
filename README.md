@@ -128,7 +128,7 @@ Graph RAG 챗봇을 투자자 관점의 질문 흐름에도 바로 활용할 수
   - 정제된 데이터를 Neo4j에 멱등성(`MERGE`)을 적용하여 **검색어별로 누적 적재**합니다.
   - **워터마크(Watermark) 기반 증분 수집:** `Keyword` 노드에 날짜별 마지막 수집 시각을 저장하여, **실제로 수집된 기사의 날짜만** 업데이트하여 누락 없이 신규 기사를 추가 수집합니다. (`neo4j_manager.py`)
   - 개별 `NewsArticle` 노드에 본문 텍스트와 벡터 임베딩을 통합 저장하여 검색 정밀도를 극대화합니다.
-  - Vector / Text-to-Cypher / Hybrid 3가지 경로를 가진 LangGraph 기반 RAG 에이전트를 제공합니다. (`hybrid_rag.py`)
+  - Vector / Text-to-Cypher / Hybrid 3가지 경로를 가진 LangGraph 기반 RAG 에이전트를 제공합니다. Text-to-Cypher 경로는 공식 `neo4j_graphrag`의 `Text2CypherRetriever`를 사용하고, 실행 직전 validating driver proxy로 `$current_keyword` 범위 제한과 read-only / `EXPLAIN` 검사를 강제합니다. 검증에 실패하면 재시도 없이 즉시 안전한 에러를 반환합니다. (`hybrid_rag.py`)
 - **[Layer 5] User Interface (`apps/gui/`)**:
   - `Streamlit` 과 `Pyvis` 기반의 대화형 지식 그래프 대시보드입니다. (`app.py`)
   - **레이아웃**: 상단에 지식 그래프, 하단에 Graph RAG 채팅창을 수직 배치합니다.
@@ -228,9 +228,9 @@ streamlit run apps/gui/app.py
   - 날짜 필터를 그래프 쿼리에 직접 반영하여 선택된 기간의 기사에서 유래한 관계만 시각화 (날짜 외 조건으로 인한 데이터 오염 제거)
 - [x] **기사 단위 배치처리 + 출처 정밀화 (Article-level Batch & Precision Citation)**
   - 기사 10개 단위 배치, `[Article_N]` ID 부여로 LLM이 각 문장의 출처를 명시하도록 강제. 답변에 인용된 기사만 정밀하게 출처로 표시
-- [x] **Cypher Injection 방어 + 피드백 루프 (Cypher Validator with Feedback Loop)**
-  - `text2cypher` 경로에 `cypher_validator` 노드 추가: 블랙리스트 키워드 차단 + `EXPLAIN`으로 문법 사전 검증
-  - 검증 실패 시 최대 3회 재시도, 3회 초과 시 `generator` 생략 후 에러 메시지를 직접 반환
+- [x] **Cypher Injection 방어 + 실행 전 검증 (Pre-execution Cypher Guard)**
+  - `text2cypher` 경로에서 실제 실행 직전 validating driver proxy가 블랙리스트 키워드 차단 + `$current_keyword` 범위 강제 + `EXPLAIN` 문법 사전 검증 적용
+  - 검증 실패 시 `generator`를 생략하고 에러 메시지를 직접 반환
 - [ ] **엔티티 별칭 설정 변경 시 노드 자동 병합 (Neo4j Sync)**
   - `entity_aliases.json`의 변경 사항을 감지하여 `apoc.refactor.mergeNodes` 기반 자동 DB 리팩토링
 - [ ] **AI 기반 엔티티 정규화 고도화 (Advanced Entity Resolution)**

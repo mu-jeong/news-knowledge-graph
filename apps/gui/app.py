@@ -1134,11 +1134,10 @@ if active_prompt:
                     result = rag_app.invoke({
                         "question": active_prompt,
                         "current_keyword": active_keyword,
-                        "retry_count": 0,
                         "final_answer": None
                     }, config=config)
                     
-                    # Cypher 검증 실패 시 final_answer에 에러 메시지가 담겨옴
+                    # Text2Cypher 실패 시 final_answer에 에러 메시지가 담겨옴
                     final_answer = result.get("final_answer")
                     if final_answer:
                         answer = final_answer

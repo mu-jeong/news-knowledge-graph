@@ -9,6 +9,13 @@ from src.configs.settings import (
     NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD,
     LLM_MODEL, EMBEDDING_MODEL
 )
+from src.nodes.text2cypher_graphrag import (
+    build_text2cypher_retriever,
+    serialize_cypher_result,
+    Text2CypherValidationError,
+)
+
+NEO4J_DATABASE = os.getenv("NEO4J_DATABASE") or None
 
 def get_neo4j_driver():
     try:
@@ -119,70 +126,60 @@ def vector_retriever_node(state: AgentState) -> dict:
         return {"search_context": "Vector 검색 중 오류 발생", "cypher_result": [], "source_links": {}}
 
 def text2cypher_retriever_node(state: AgentState) -> dict:
-    from pydantic import BaseModel
-    
     question = state.get("question", "")
     current_keyword = state.get("current_keyword", "")
     driver = get_neo4j_driver()
     if not driver:
-        return {"cypher_result": [], "search_context": "DB 연결 실패"}
+        return {"generated_cypher": "", "cypher_result": [], "search_context": "DB 연결 실패", "source_links": {}, "final_answer": "DB 연결 실패"}
     if not current_keyword:
-        return {"cypher_result": [], "search_context": "현재 검색어 범위가 설정되지 않았습니다."}
+        return {"generated_cypher": "", "cypher_result": [], "search_context": "현재 검색어 범위가 설정되지 않았습니다.", "source_links": {}, "final_answer": "현재 검색어 범위가 설정되지 않았습니다."}
 
-    schema_info = """
-    Node labels:
-    - Entity
-    - Company
-    - Industry
-    - NewsArticle
-    - MacroEvent
-    - Product
-    - Technology
-    - RiskFactor
-    
-    Relationship types: MENTIONS, SUPPLIES_TO, COMPETES_WITH, BELONGS_TO, PART_OF, RELEASED, USES, EXPOSED_TO, BENEFITS_FROM, AFFECTS, OWNS, RELATED_TO, etc.
-    ※ 관계성(Edge) 정보 추출 시, 가급적 관계의 속성인 `source_url`도 함께 RETURN 하도록 작성하세요.
-    """
-    
-    class CypherQuery(BaseModel):
-        query: str
-        
-    llm = ChatGoogleGenerativeAI(model=LLM_MODEL, temperature=0).with_structured_output(CypherQuery)
-    prompt = (
-        "다음 사용자의 질문에 답하기 위해 위 구조의 Neo4j 지식 그래프에서 정보를 추출하는 Cypher 쿼리를 작성하세요.\n"
-        f"[현재 검색어 범위] {current_keyword}\n"
-        f"[질문] {question}\n"
-        "[중요 제약]\n"
-        "1. 반드시 현재 검색어 범위 안에서만 조회해야 합니다.\n"
-        "2. 쿼리에는 반드시 `MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(a:NewsArticle)` 또는 이와 동등한 `$current_keyword` 기반 범위 제한이 포함되어야 합니다.\n"
-        "3. `$current_keyword` 파라미터를 그대로 사용하세요. 값은 코드에서 주입됩니다.\n"
-        "4. 현재 검색어와 무관한 전역 그래프 조회 쿼리는 금지합니다.\n"
-        f"[스키마]\n{schema_info}"
-    )
-    
     try:
-        cypher_resp = llm.invoke(prompt)
-        cypher_query = cypher_resp.query
-        
-        with driver.session() as session:
-            result = session.run(cypher_query, current_keyword=current_keyword)
-            # data()를 사용하면 Node/Relationship 객체가 dict로 자동 변환됩니다.
-            data = [record.data() for record in result]
-            
-        # JSON 직렬화 불가 객체(DateTime 등) 처리
-        def _json_serializable(obj):
-            try:
-                # datetime, date 등 isoformat() 지원 시 호출
-                if hasattr(obj, 'isoformat'):
-                    return obj.isoformat()
-            except:
-                pass
-            return str(obj)
+        retriever, validating_driver = build_text2cypher_retriever(driver)
+        validating_driver.set_runtime_parameters({"current_keyword": current_keyword})
+        result = retriever.search(
+            query_text=question,
+            prompt_params={"current_keyword": current_keyword},
+        )
 
-        search_context = json.dumps(data, ensure_ascii=False, default=_json_serializable)[:2000]
-        return {"generated_cypher": cypher_query, "cypher_result": data, "search_context": search_context}
+        cypher_query = result.metadata.get("cypher", "")
+        data = [item.content for item in result.items]
+        source_links = {}
+        for idx, row in enumerate(data, start=1):
+            source_url = row.get("source_url") or row.get("article_url") or row.get("url")
+            if isinstance(source_url, str) and source_url:
+                source_links[f"[Result_{idx}]"] = source_url
+
+        return {
+            "generated_cypher": cypher_query,
+            "cypher_result": data,
+            "search_context": serialize_cypher_result(data),
+            "source_links": source_links,
+            "final_answer": None,
+        }
+    except Text2CypherValidationError as e:
+        return {
+            "generated_cypher": e.query,
+            "cypher_result": [],
+            "search_context": "",
+            "source_links": {},
+            "final_answer": (
+                "⚠️ 생성된 Cypher를 실행할 수 없습니다.\n\n"
+                f"**실패 사유:** {e.reason}\n\n"
+                f"**생성된 쿼리:**\n```cypher\n{e.query}\n```"
+            ),
+        }
     except Exception as e:
-        return {"cypher_result": [], "search_context": f"Cypher 에러: {e}"}
+        error_message = f"Text2Cypher 생성 오류: {e}"
+        return {
+            "generated_cypher": "",
+            "cypher_result": [],
+            "search_context": error_message,
+            "source_links": {},
+            "final_answer": error_message,
+        }
+    finally:
+        driver.close()
 
 def vector_cypher_retriever_node(state: AgentState) -> dict:
     question = state.get("question", "")
@@ -233,4 +230,3 @@ def vector_cypher_retriever_node(state: AgentState) -> dict:
             return {"search_context": search_context, "source_links": source_links}
     except Exception as e:
         return {"search_context": f"Hybrid 검색 에러: {e}", "source_links": {}}
-

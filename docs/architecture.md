@@ -105,24 +105,20 @@
   * `upsert_articles(keyword, articles)`: 기사를 `NewsArticle` 노드로 저장하고 `Keyword` 노드와 연결합니다.
   * `load_graph_data(graph_data, batch_text)`: 기사별 텍스트를 개별적으로 임베딩하여 `NewsArticle`에 저장하고, 추출된 엔티티와 관계를 `[:MENTIONS]` 및 엔티티 간 관계로 직접 연결합니다. taxonomy 관계도 provenance와 함께 적재합니다.
   * `create_vector_index()`: `NewsArticle` 노드의 임베딩을 저장하는 벡터 인덱스(`article_embedding`, 3072차원)를 생성합니다.
-* **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), 재시도 횟수(`retry_count`), 검증 실패 시 에러 메시지(`final_answer`), 그리고 **기사 ID와 URL 매핑 테이블(`source_links`)**을 관리합니다.
-* **`hybrid_rag.py`:** `router`를 필두로 Vector / Text-to-Cypher / Hybrid(Entity-based) 3가지 검색 경로를 가진 LangGraph 기반 RAG 에이전트입니다. `MemorySaver`를 통해 대화 기록을 보존하며, **text2cypher 경로에는 `cypher_validator` 노드를 반드시 거쳐 Cypher Injection 및 문법 오류를 차단합니다.**
+* **`state.py`:** LangGraph에서 사용하는 `AgentState`를 정의합니다. 질문, 라우팅 결정, 추출된 엔티티, Cypher 쿼리 및 결과, 대화 기록(`chat_history`), text2cypher 실패 시 즉시 반환할 에러 메시지(`final_answer`), 그리고 **기사 ID와 URL 매핑 테이블(`source_links`)**을 관리합니다.
+* **`hybrid_rag.py`:** `router`를 필두로 Vector / Text-to-Cypher / Hybrid(Entity-based) 3가지 검색 경로를 가진 LangGraph 기반 RAG 에이전트입니다. `MemorySaver`를 통해 대화 기록을 보존하며, **text2cypher 경로는 retriever 결과에 따라 `generator` 또는 `END`로 바로 분기하는 최소 구조를 사용합니다.**
 
 ### `src/nodes/` (Layer 4-1: RAG Retriever & Generator)
 
 * **`router.py`:** 사용자의 자연어 질문을 분석하여 어떤 검색 경로(`vector`, `text2cypher`, `vector_cypher`)를 사용할지 결정하는 분류기(Classifier) 노드입니다.
 * **`retriever.py`:** RAG 검색을 수행하는 3개의 노드를 포함합니다. 모든 리트리버는 검색된 기사(`NewsArticle`)의 본문 텍스트와 URL을 Neo4j에서 직접 가져와 `_prepare_search_context`를 통해 전역적으로 고유한 번호를 매기고 매핑 테이블을 생성합니다.
   * `vector_retriever_node`: `article_embedding` 벡터 인덱스를 사용해 기사 단위로 검색하고, `NewsArticle`의 URL을 함께 리턴합니다.
-  * `text2cypher_retriever_node`: LLM이 자연어 → Cypher 변환 후 Neo4j 직접 쿼리. 관계형 추론이 필요한 질문에 유리합니다. → 반드시 `cypher_validator`를 거칩니다.
+  * `text2cypher_retriever_node`: 공식 `neo4j_graphrag`의 `Text2CypherRetriever`를 사용해 자연어 → Cypher 변환과 조회를 수행합니다. 실행 직전에는 driver proxy에서 `$current_keyword` 범위 강제, read-only 검사, `EXPLAIN` 문법 검사를 적용해 안전하게 쿼리합니다. 검증에 실패하면 재시도 없이 즉시 에러 메시지를 반환합니다. 관계형 추론이 필요한 질문에 유리합니다.
   * `vector_cypher_retriever_node`: vector-first Hybrid 검색. 먼저 `article_embedding` 인덱스로 관련 기사를 찾고, 그 기사 주변의 `MENTIONS` 엔티티와 엔티티 관계를 Cypher로 확장하여 리턴합니다.
-* **`cypher_validator.py`:** (필수 보안 노드) `text2cypher_retriever`가 생성한 Cypher 쿼리를 실행 전에 2단계로 검증합니다.
-  * **블랙리스트 검사:** `DELETE`, `DETACH`, `DROP`, `REMOVE`, `FOREACH`, `apoc.*` 등 파괴적/변조 명령어 즉시 차단
-  * **Neo4j 문법 검사:** `EXPLAIN {query}`로 실제 데이터를 읽지 않고 서버에서 문법 사전 검증
-  * **피드백 루프:** 검증 실패 시 `retry_count < 3`이면 `text2cypher_retriever`로 돌아가 재시도, `retry_count >= 3`이면 `generator` 없이 `final_answer`에 에러 메시지를 담아 즉시 종료
 * **`generator.py`:** 검색된 컨텍스트와 **[참조 링크 매핑 테이블]**을 바탕으로 답변을 생성합니다.
   * 각 기사에 새로 부여된 고유 ID(`[Article_1]`~`[Article_N]`)를 활용하여 각 문장 끝에 출처를 표기합니다.
   * **정밀 출처 표기:** LLM은 제공된 매핑 테이블을 참고하여 HTML 링크(`<a href="..." target="_blank">[출처]</a>`)를 답변에 직접 삽입함으로써 정보의 투명성을 극대화합니다.
-  * ⚠️ `cypher_validator`가 `final_answer`를 설정한 경우 `generator`는 실행되지 않고 종료합니다.
+  * ⚠️ `text2cypher_retriever`가 `final_answer`를 설정한 경우 `generator`는 실행되지 않고 종료합니다.
 
 ### `apps/gui/` (Layer 5: User Interface & Analytics)
 

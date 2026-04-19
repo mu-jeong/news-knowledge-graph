@@ -3,6 +3,7 @@ python-dotenv
 langchain
 langchain-google-genai
 neo4j>=5.0.0
+neo4j-graphrag
 streamlit
 pyvis
 langchain-neo4j

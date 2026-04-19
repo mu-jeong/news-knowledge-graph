@@ -18,6 +18,4 @@ class AgentState(TypedDict):
     generation: str            # 최종 답변
     chat_history: Annotated[list, operator.add]  # 대화 기록
 
-    # Cypher 검증 피드백 루프용 필드
-    retry_count: int           # text2cypher 재시도 횟수 (최대 3회)
-    final_answer: Optional[str]  # 검증 실패 시 generator 없이 직접 반환할 에러 메시지
+    final_answer: Optional[str]  # text2cypher 실패 시 generator 없이 직접 반환할 에러 메시지
