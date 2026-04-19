@@ -101,7 +101,7 @@ Examples:
 {examples}
 
 Rules:
-1. You must scope the query to the current keyword with MATCH (k:Keyword {name: $current_keyword})-[:HAS_ARTICLE]->(a:NewsArticle) or an equivalent pattern that keeps every result inside that keyword scope.
+1. You must scope the query to the current keyword with MATCH (k:Keyword {{name: $current_keyword}})-[:HAS_ARTICLE]->(a:NewsArticle) or an equivalent pattern that keeps every result inside that keyword scope.
 2. Use the parameter $current_keyword exactly as written. Never inline the keyword value.
 3. Only produce read-only Cypher. Never use CREATE, MERGE, DELETE, SET, REMOVE, CALL apoc, or schema-changing commands.
 4. Prefer explicit managed relationships such as SUPPLIES_TO, COMPETES_WITH, EXPOSED_TO, BENEFITS_FROM, AFFECTS, OWNS, and RELATED_TO only when no better relationship fits.
@@ -147,12 +147,21 @@ class Text2CypherValidationError(Exception):
         self.reason = reason
 
 
+def _normalize_cypher(query: str) -> str:
+    normalized = query.strip()
+    normalized = re.sub(r"^\s*```(?:cypher)?\s*", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"\s*```\s*$", "", normalized, flags=re.IGNORECASE)
+    normalized = re.sub(r"^\s*cypher\s*\n", "", normalized, flags=re.IGNORECASE)
+    return normalized.strip()
+
+
 def _is_read_only(query: str) -> tuple[bool, str]:
-    upper_q = query.upper().strip()
+    normalized_query = _normalize_cypher(query)
+    upper_q = normalized_query.upper()
 
     for pattern in _BLOCKED_KEYWORDS:
-        if re.search(pattern, query, re.IGNORECASE):
-            matched = re.search(pattern, query, re.IGNORECASE).group()
+        if re.search(pattern, normalized_query, re.IGNORECASE):
+            matched = re.search(pattern, normalized_query, re.IGNORECASE).group()
             return False, f"차단된 명령어 감지: `{matched}` — 읽기 전용 쿼리만 허용합니다."
 
     starts_ok = any(upper_q.startswith(kw.upper()) for kw in _ALLOWED_START_KEYWORDS)
@@ -164,10 +173,11 @@ def _is_read_only(query: str) -> tuple[bool, str]:
 
 def _check_syntax(query: str, current_keyword: str = "") -> tuple[bool, str]:
     try:
+        normalized_query = _normalize_cypher(query)
         driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
         with driver.session() as session:
             params = {"current_keyword": current_keyword} if current_keyword else {}
-            session.run(f"EXPLAIN {query}", **params)
+            session.run(f"EXPLAIN {normalized_query}", **params)
         driver.close()
         return True, ""
     except Exception as e:
@@ -186,26 +196,27 @@ class ValidatingNeo4jDriverProxy:
         self._runtime_parameters = dict(parameters or {})
 
     def execute_query(self, query_: str, **kwargs: Any):
-        self.last_query = query_
+        normalized_query = _normalize_cypher(query_)
+        self.last_query = normalized_query
         current_keyword = self._runtime_parameters.get("current_keyword", "")
 
-        is_safe, reason = _is_read_only(query_)
+        is_safe, reason = _is_read_only(normalized_query)
         if not is_safe:
-            raise Text2CypherValidationError(query_, reason)
+            raise Text2CypherValidationError(normalized_query, reason)
 
-        if current_keyword and "$current_keyword" not in query_:
+        if current_keyword and "$current_keyword" not in normalized_query:
             raise Text2CypherValidationError(
-                query_,
+                normalized_query,
                 "현재 검색어 범위 제한이 없는 Cypher입니다. `$current_keyword`를 사용해야 합니다.",
             )
 
-        is_valid_syntax, err_msg = _check_syntax(query_, current_keyword=current_keyword)
+        is_valid_syntax, err_msg = _check_syntax(normalized_query, current_keyword=current_keyword)
         if not is_valid_syntax:
-            raise Text2CypherValidationError(query_, err_msg)
+            raise Text2CypherValidationError(normalized_query, err_msg)
 
         forwarded_kwargs = dict(kwargs)
         forwarded_kwargs["parameters_"] = self._runtime_parameters
-        return self._driver.execute_query(query_=query_, **forwarded_kwargs)
+        return self._driver.execute_query(query_=normalized_query, **forwarded_kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._driver, name)

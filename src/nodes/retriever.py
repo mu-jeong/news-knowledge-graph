@@ -164,9 +164,9 @@ def text2cypher_retriever_node(state: AgentState) -> dict:
             "search_context": "",
             "source_links": {},
             "final_answer": (
-                "⚠️ 생성된 Cypher를 실행할 수 없습니다.\n\n"
-                f"**실패 사유:** {e.reason}\n\n"
-                f"**생성된 쿼리:**\n```cypher\n{e.query}\n```"
+                "현재 질문은 그래프 질의로 안전하게 처리할 수 없어 답변을 생성하지 못했습니다.\n\n"
+                f"사유: {e.reason}\n\n"
+                "질문을 조금 더 구체적으로 바꾸거나, 비교 대상/기업명을 명시해서 다시 시도해 주세요."
             ),
         }
     except Exception as e:
